@@ -1,0 +1,1927 @@
+import hashlib
+import json
+import re
+import secrets
+import urllib.parse
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+
+from .database import (
+    get_configured_admin_emails,
+    get_db_connection,
+    hash_password,
+    init_db,
+    verify_password,
+)
+from .notifications import send_admin_booking_notification
+from .oauth_providers import (
+    ProviderHTTPError,
+    build_bitbucket_authorize_url,
+    build_github_authorize_url,
+    build_gitlab_authorize_url,
+    build_google_authorize_url,
+    exchange_and_verify_google_code,
+    exchange_bitbucket_code,
+    exchange_github_code,
+    exchange_gitlab_code,
+    fetch_bitbucket_repo_branches,
+    fetch_github_repo_branches,
+    fetch_gitlab_repo_branches,
+    generate_pkce_pair,
+    get_frontend_base_url,
+    get_provider_oauth_config,
+    validate_gitlab_instance_url,
+    validate_relative_redirect,
+    verify_bitbucket_access,
+    verify_bitbucket_single_repo,
+    verify_github_access,
+    verify_github_single_repo,
+    verify_gitlab_access,
+    verify_gitlab_single_repo,
+)
+
+EMAIL_REGEX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+ALLOWED_STATUSES = {"Pending", "Confirmed", "Rescheduled", "Cancelled", "Completed"}
+REPO_PROVIDERS = {"github", "gitlab", "bitbucket"}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+
+init_db()
+
+app = FastAPI(
+    title="SilentGuard AI",
+    description="AI Code Risk Intelligence Platform",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# Pydantic Schemas
+# ============================================================================
+
+
+class SignupPayload(BaseModel):
+    full_name: str
+    email: str
+    password: str
+    company: Optional[str] = None
+    job_title: Optional[str] = None
+
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+
+class ProfileUpdatePayload(BaseModel):
+    full_name: Optional[str] = None
+    company: Optional[str] = None
+    job_title: Optional[str] = None
+
+
+class ProviderConnectPayload(BaseModel):
+    redirect_path: Optional[str] = "/projects"
+    instance_url: Optional[str] = None
+    access_token: Optional[str] = None
+    declared_scopes: Optional[str] = None
+
+
+class RepositoryScanPayload(BaseModel):
+    provider: str
+    repo_full_name: str
+    branch: Optional[str] = None
+
+
+class RepositorySelectPayload(BaseModel):
+    repo_full_name: str
+    branch: Optional[str] = None
+
+
+class DemoBookingCreatePayload(BaseModel):
+    full_name: str
+    work_email: str
+    company: Optional[str] = None
+    team_size: Optional[str] = None
+    preferred_date: Optional[str] = None
+    preferred_time: Optional[str] = None
+    timezone: Optional[str] = None
+    message: Optional[str] = None
+    additional_notes: Optional[str] = None
+    primary_interest: Optional[str] = None
+
+
+class AdminBookingUpdatePayload(BaseModel):
+    status: str
+    admin_notes: Optional[str] = None
+    confirmed_datetime: Optional[str] = None
+
+
+# ============================================================================
+# Session, Auth & Serialization Helpers
+# ============================================================================
+
+
+def _hash_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def _serialize_user(row) -> dict[str, Any]:
+    """Serialize user row without ever exposing password_hash."""
+    keys = row.keys()
+    return {
+        "id": row["id"],
+        "full_name": row["full_name"],
+        "email": row["email"],
+        "company": row["company"],
+        "job_title": row["job_title"],
+        "role": row["role"],
+        "auth_provider": row["auth_provider"] if "auth_provider" in keys else "email",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _serialize_provider_connection(provider: str, row: Optional[Any]) -> dict[str, Any]:
+    """
+    Serialize a repository provider connection without EVER exposing
+    access_token, refresh_token, or client_secret.
+    """
+    cfg = get_provider_oauth_config(provider)
+    if not row:
+        return {
+            "provider": provider,
+            "status": "not_connected",
+            "oauth_configured": cfg["configured"],
+            "required_env": cfg["required_env"],
+            "redirect_uri": cfg["redirect_uri"],
+            "instance_url": cfg.get("instance_url"),
+            "provider_account_id": None,
+            "provider_username": None,
+            "provider_email": None,
+            "scopes": None,
+            "accessible_repos_count": 0,
+            "repositories": [],
+            "selected_repo_full_name": None,
+            "selected_branch": None,
+            "last_error": None,
+            "last_verified_at": None,
+            "updated_at": None,
+        }
+
+    repos: list[dict[str, Any]] = []
+    if row["sample_repositories_json"] and row["status"] == "connected":
+        try:
+            repos = json.loads(row["sample_repositories_json"])
+        except Exception:
+            repos = []
+
+    row_keys = set(row.keys())
+    selected_repo = (
+        row["selected_repo_full_name"]
+        if "selected_repo_full_name" in row_keys and row["status"] == "connected"
+        else None
+    )
+    selected_branch = (
+        row["selected_branch"]
+        if "selected_branch" in row_keys and row["status"] == "connected"
+        else None
+    )
+
+    return {
+        "provider": provider,
+        "status": row["status"],
+        "oauth_configured": cfg["configured"],
+        "required_env": cfg["required_env"],
+        "redirect_uri": cfg["redirect_uri"],
+        "instance_url": row["instance_url"] or cfg.get("instance_url"),
+        "provider_account_id": row["provider_account_id"],
+        "provider_username": row["provider_username"],
+        "provider_email": row["provider_email"],
+        "scopes": row["scopes"],
+        "accessible_repos_count": row["accessible_repos_count"] if row["status"] == "connected" else 0,
+        "repositories": repos,
+        "selected_repo_full_name": selected_repo,
+        "selected_branch": selected_branch,
+        "last_error": row["last_error"],
+        "last_verified_at": row["last_verified_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _upsert_provider_connection(
+    conn,
+    *,
+    user_id: str,
+    provider: str,
+    status: str,
+    provider_account_id: Optional[str] = None,
+    provider_username: Optional[str] = None,
+    provider_email: Optional[str] = None,
+    instance_url: Optional[str] = None,
+    scopes: Optional[str] = None,
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    token_expires_at: Optional[str] = None,
+    repositories: Optional[list[dict[str, Any]]] = None,
+    selected_repo_full_name: Optional[str] = None,
+    selected_branch: Optional[str] = None,
+    last_error: Optional[str] = None,
+    last_verified_at: Optional[str] = None,
+) -> dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    repos_list = repositories or []
+    repos_json = json.dumps(repos_list)
+    repos_count = len(repos_list) if status == "connected" else 0
+
+    existing = conn.execute(
+        "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+        (user_id, provider),
+    ).fetchone()
+
+    resolved_selected_repo: Optional[str] = None
+    resolved_selected_branch: Optional[str] = None
+    if status == "connected":
+        if selected_repo_full_name is not None:
+            resolved_selected_repo = selected_repo_full_name
+            resolved_selected_branch = selected_branch or "main"
+        elif existing and "selected_repo_full_name" in existing.keys() and existing["selected_repo_full_name"]:
+            # Preserve existing selection if still in accessible repos
+            existing_sel = existing["selected_repo_full_name"]
+            if any(r.get("full_name") == existing_sel for r in repos_list):
+                resolved_selected_repo = existing_sel
+                resolved_selected_branch = existing["selected_branch"] or "main"
+        if not resolved_selected_repo and repos_list:
+            resolved_selected_repo = str(repos_list[0].get("full_name") or "")
+            resolved_selected_branch = str(repos_list[0].get("default_branch") or "main")
+
+    if existing:
+        conn.execute(
+            """
+            UPDATE provider_connections
+            SET status = ?,
+                provider_account_id = ?,
+                provider_username = ?,
+                provider_email = ?,
+                instance_url = ?,
+                scopes = ?,
+                access_token = ?,
+                refresh_token = ?,
+                token_expires_at = ?,
+                accessible_repos_count = ?,
+                sample_repositories_json = ?,
+                selected_repo_full_name = ?,
+                selected_branch = ?,
+                last_error = ?,
+                last_verified_at = ?,
+                updated_at = ?
+            WHERE user_id = ? AND provider = ?
+            """,
+            (
+                status,
+                provider_account_id,
+                provider_username,
+                provider_email,
+                instance_url,
+                scopes,
+                access_token if status == "connected" else None,
+                refresh_token if status == "connected" else None,
+                token_expires_at,
+                repos_count,
+                repos_json if status == "connected" else "[]",
+                resolved_selected_repo,
+                resolved_selected_branch,
+                last_error,
+                last_verified_at,
+                now_iso,
+                user_id,
+                provider,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO provider_connections (
+                id, user_id, provider, status,
+                provider_account_id, provider_username, provider_email,
+                instance_url, scopes, access_token, refresh_token, token_expires_at,
+                accessible_repos_count, sample_repositories_json,
+                selected_repo_full_name, selected_branch,
+                last_error, last_verified_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"conn_{uuid.uuid4().hex[:12]}",
+                user_id,
+                provider,
+                status,
+                provider_account_id,
+                provider_username,
+                provider_email,
+                instance_url,
+                scopes,
+                access_token if status == "connected" else None,
+                refresh_token if status == "connected" else None,
+                token_expires_at,
+                repos_count,
+                repos_json if status == "connected" else "[]",
+                resolved_selected_repo,
+                resolved_selected_branch,
+                last_error,
+                last_verified_at,
+                now_iso,
+                now_iso,
+            ),
+        )
+
+    row = conn.execute(
+        "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+        (user_id, provider),
+    ).fetchone()
+    return _serialize_provider_connection(provider, row)
+
+
+def _ensure_strict_relative_redirect(raw_path: Optional[str], default: str = "/workspace") -> str:
+    """
+    Enforce that a redirect target is a relative path and raise HTTP 400
+    if a caller attempts an open redirect to an external origin.
+    """
+    if not raw_path:
+        return default
+    cleaned = raw_path.strip()
+    if (
+        not cleaned.startswith("/")
+        or cleaned.startswith("//")
+        or "\\" in cleaned
+        or "://" in cleaned
+        or cleaned.lower().startswith("/\\")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid redirect URL: external or protocol-relative redirects are forbidden.",
+        )
+    return validate_relative_redirect(cleaned, default=default)
+
+
+def _serialize_booking(conn, row) -> dict:
+    history_rows = conn.execute(
+        """
+        SELECT id, booking_id, previous_status, new_status, changed_by_email, notes, changed_at
+        FROM booking_status_history
+        WHERE booking_id = ?
+        ORDER BY changed_at DESC
+        """,
+        (row["id"],),
+    ).fetchall()
+
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "full_name": row["full_name"],
+        "work_email": row["work_email"],
+        "company": row["company"],
+        "team_size": row["team_size"],
+        "preferred_date": row["preferred_date"],
+        "preferred_time": row["preferred_time"],
+        "timezone": row["timezone"],
+        "message": row["message"],
+        "status": row["status"],
+        "admin_notes": row["admin_notes"],
+        "confirmed_datetime": row["confirmed_datetime"],
+        "email_notification_status": row["email_notification_status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "status_history": [dict(h) for h in history_rows],
+    }
+
+
+def create_user_session(conn, user_id: str) -> str:
+    raw_token = f"sg_sess_{secrets.token_urlsafe(32)}"
+    token_hash = _hash_token(raw_token)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=7)
+    conn.execute(
+        """
+        INSERT INTO sessions (token_hash, user_id, created_at, expires_at, revoked)
+        VALUES (?, ?, ?, ?, 0)
+        """,
+        (token_hash, user_id, now.isoformat(), expires.isoformat()),
+    )
+    return raw_token
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    parts = authorization.strip().split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return None
+
+
+def get_optional_user(authorization: Optional[str] = Header(default=None)) -> Optional[dict]:
+    raw_token = _extract_bearer_token(authorization)
+    if not raw_token:
+        return None
+    token_hash = _hash_token(raw_token)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT u.*
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ? AND s.revoked = 0 AND s.expires_at > ?
+            """,
+            (token_hash, now_iso),
+        ).fetchone()
+        if not row:
+            return None
+        return _serialize_user(row)
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> dict:
+    user = get_optional_user(authorization)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please sign in to access this resource.",
+        )
+    return user
+
+
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Administrator authorization required to access this endpoint.",
+        )
+    return current_user
+
+
+# ============================================================================
+# Health & Root Endpoints
+# ============================================================================
+
+
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "application": "SilentGuard AI",
+        "database": "sqlite_connected",
+    }
+
+
+@app.get("/")
+def home():
+    return {"message": "SilentGuard AI backend is running"}
+
+
+# ============================================================================
+# 1. Email/Password & Official Google OAuth 2.0 Authentication
+# ============================================================================
+
+
+@app.post("/api/auth/signup")
+def signup(payload: SignupPayload):
+    full_name = payload.full_name.strip()
+    email = payload.email.strip().lower()
+    password = payload.password
+
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    if not email or not EMAIL_REGEX.match(email):
+        raise HTTPException(status_code=400, detail="A valid work email address is required")
+    if not password or len(password) < 8:
+        raise HTTPException(
+            status_code=400, detail="Password must be at least 8 characters long"
+        )
+
+    admin_emails = get_configured_admin_emails()
+    role = "admin" if email in admin_emails else "user"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    user_id = f"usr_{uuid.uuid4().hex[:12]}"
+
+    with get_db_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="An account with this email address already exists. Please log in.",
+            )
+
+        conn.execute(
+            """
+            INSERT INTO users (
+                id, full_name, email, company, job_title,
+                password_hash, role, auth_provider, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'email', ?, ?)
+            """,
+            (
+                user_id,
+                full_name,
+                email,
+                payload.company.strip() if payload.company else None,
+                payload.job_title.strip() if payload.job_title else None,
+                hash_password(password),
+                role,
+                now_iso,
+                now_iso,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET user_id = ?, updated_at = ?
+            WHERE user_id IS NULL AND lower(work_email) = ?
+            """,
+            (user_id, now_iso, email),
+        )
+
+        token = create_user_session(conn, user_id)
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+
+    return {
+        "status": "success",
+        "token": token,
+        "user": _serialize_user(user_row),
+    }
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginPayload):
+    email = payload.email.strip().lower()
+    password = payload.password
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    with get_db_connection() as conn:
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if not user_row or not verify_password(password, user_row["password_hash"]):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email address or password.",
+            )
+
+        token = create_user_session(conn, user_row["id"])
+
+    return {
+        "status": "success",
+        "token": token,
+        "user": _serialize_user(user_row),
+    }
+
+
+@app.get("/api/auth/google/status")
+def google_oauth_status():
+    cfg = get_provider_oauth_config("google")
+    return {
+        "provider": "google",
+        "configured": cfg["configured"],
+        "required_env": cfg["required_env"],
+        "redirect_uri": cfg["redirect_uri"],
+    }
+
+
+@app.get("/api/auth/google/start")
+@app.post("/api/auth/google/start")
+def google_oauth_start(
+    redirect: Optional[str] = Query(default=None),
+    redirect_path: Optional[str] = Query(default=None),
+    payload: Optional[ProviderConnectPayload] = None,
+):
+    requested_redirect = (
+        (payload.redirect_path if payload and payload.redirect_path is not None else None)
+        or redirect_path
+        or redirect
+        or "/workspace"
+    )
+    frontend_redirect = _ensure_strict_relative_redirect(
+        requested_redirect, default="/workspace"
+    )
+    cfg = get_provider_oauth_config("google")
+
+    if not cfg["configured"]:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google OAuth 2.0 is not configured on this server. "
+                "Configure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the backend environment "
+                "to enable official Google Sign-In, or sign in with your work email and password."
+            ),
+        )
+
+    state = f"st_google_{secrets.token_urlsafe(32)}"
+    code_verifier, code_challenge = generate_pkce_pair()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=10)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_states (
+                state, provider, purpose, user_id, code_verifier,
+                redirect_uri, frontend_redirect, instance_url,
+                created_at, expires_at, consumed
+            )
+            VALUES (?, 'google', 'login', NULL, ?, ?, ?, NULL, ?, ?, 0)
+            """,
+            (
+                state,
+                code_verifier,
+                cfg["redirect_uri"],
+                frontend_redirect,
+                now.isoformat(),
+                expires.isoformat(),
+            ),
+        )
+
+    auth_url = build_google_authorize_url(state=state, code_challenge=code_challenge)
+    return {
+        "status": "redirect",
+        "provider": "google",
+        "authorization_url": auth_url,
+        "state": state,
+    }
+
+
+@app.get("/api/auth/google/callback")
+def google_oauth_callback(
+    state: Optional[str] = Query(default=None),
+    code: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+    error_description: Optional[str] = Query(default=None),
+    response_mode: Optional[str] = Query(default="redirect"),
+):
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing OAuth state parameter.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        state_row = conn.execute(
+            """
+            SELECT * FROM oauth_states
+            WHERE state = ? AND provider = 'google' AND purpose = 'login'
+            """,
+            (state,),
+        ).fetchone()
+
+        if not state_row:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state parameter.")
+        if state_row["consumed"] == 1:
+            raise HTTPException(status_code=400, detail="OAuth state has already been used.")
+        if state_row["expires_at"] < now_iso:
+            raise HTTPException(status_code=400, detail="OAuth state has expired. Please try signing in again.")
+
+        # Immediately mark state consumed to prevent replay
+        conn.execute("UPDATE oauth_states SET consumed = 1 WHERE state = ?", (state,))
+        frontend_redirect = state_row["frontend_redirect"]
+        code_verifier = state_row["code_verifier"]
+
+    if error:
+        desc = error_description or f"Google authorization failed ({error})."
+        if response_mode == "redirect":
+            fe = get_frontend_base_url()
+            qs = urllib.parse.urlencode({"oauth_error": desc, "provider": "google"})
+            return RedirectResponse(url=f"{fe}/login?{qs}", status_code=302)
+        raise HTTPException(status_code=401, detail=desc)
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code from Google.")
+
+    try:
+        verified = exchange_and_verify_google_code(code=code, code_verifier=code_verifier)
+    except ProviderHTTPError as exc:
+        detail = (
+            exc.body.get("detail")
+            if isinstance(exc.body, dict) and exc.body.get("detail")
+            else "Failed to verify Google authorization code."
+        )
+        if response_mode == "redirect":
+            fe = get_frontend_base_url()
+            qs = urllib.parse.urlencode({"oauth_error": str(detail), "provider": "google"})
+            return RedirectResponse(url=f"{fe}/login?{qs}", status_code=302)
+        raise HTTPException(status_code=exc.status_code, detail=str(detail)) from exc
+
+    email = verified["email"]
+    full_name = verified["full_name"]
+    provider_acct_id = verified["provider_account_id"]
+    admin_emails = get_configured_admin_emails()
+
+    with get_db_connection() as conn:
+        existing = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if existing:
+            user_id = existing["id"]
+            conn.execute(
+                """
+                UPDATE users
+                SET auth_provider = 'google', provider_account_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (provider_acct_id, now_iso, user_id),
+            )
+        else:
+            user_id = f"usr_{uuid.uuid4().hex[:12]}"
+            role = "admin" if email in admin_emails else "user"
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, full_name, email, company, job_title,
+                    password_hash, role, auth_provider, provider_account_id,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, NULL, NULL, ?, ?, 'google', ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    full_name,
+                    email,
+                    hash_password(secrets.token_urlsafe(32)),
+                    role,
+                    provider_acct_id,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET user_id = ?, updated_at = ?
+            WHERE user_id IS NULL AND lower(work_email) = ?
+            """,
+            (user_id, now_iso, email),
+        )
+
+        session_token = create_user_session(conn, user_id)
+        user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    if response_mode == "redirect":
+        fe = get_frontend_base_url()
+        qs = urllib.parse.urlencode({"token": session_token, "redirect": frontend_redirect})
+        return RedirectResponse(url=f"{fe}/oauth/callback?{qs}", status_code=302)
+
+    return {
+        "status": "success",
+        "token": session_token,
+        "user": _serialize_user(user_row),
+        "redirect": frontend_redirect,
+    }
+
+
+@app.post("/api/auth/logout")
+def logout(
+    authorization: Optional[str] = Header(default=None),
+    _current_user: dict = Depends(get_current_user),
+):
+    raw_token = _extract_bearer_token(authorization)
+    if raw_token:
+        token_hash = _hash_token(raw_token)
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE sessions SET revoked = 1 WHERE token_hash = ?",
+                (token_hash,),
+            )
+    return {"status": "success", "message": "Session terminated."}
+
+
+@app.get("/api/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    return {"status": "success", "user": current_user}
+
+
+@app.patch("/api/auth/profile")
+def update_profile(
+    payload: ProfileUpdatePayload,
+    current_user: dict = Depends(get_current_user),
+):
+    full_name = (
+        payload.full_name.strip()
+        if payload.full_name is not None
+        else current_user["full_name"]
+    )
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Full name cannot be empty")
+
+    company = (
+        payload.company.strip()
+        if payload.company is not None
+        else current_user["company"]
+    )
+    job_title = (
+        payload.job_title.strip()
+        if payload.job_title is not None
+        else current_user["job_title"]
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET full_name = ?, company = ?, job_title = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                full_name,
+                company or None,
+                job_title or None,
+                now_iso,
+                current_user["id"],
+            ),
+        )
+        updated_row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (current_user["id"],)
+        ).fetchone()
+
+    return {"status": "success", "user": _serialize_user(updated_row)}
+
+
+# ============================================================================
+# 2. Repository Provider Integrations (GitHub, GitLab, Bitbucket)
+# ============================================================================
+
+
+def _validate_repo_provider(provider: str) -> str:
+    p = provider.strip().lower()
+    if p not in REPO_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported repository provider '{provider}'. Supported: github, gitlab, bitbucket.",
+        )
+    return p
+
+
+def _run_provider_verification(
+    provider: str,
+    access_token: str,
+    instance_url: Optional[str] = None,
+    declared_scopes: Optional[str] = None,
+) -> dict[str, Any]:
+    if provider == "github":
+        return verify_github_access(access_token=access_token, declared_scopes=declared_scopes)
+    if provider == "gitlab":
+        return verify_gitlab_access(
+            access_token=access_token,
+            instance_url=instance_url,
+            declared_scopes=declared_scopes,
+        )
+    if provider == "bitbucket":
+        return verify_bitbucket_access(access_token=access_token, declared_scopes=declared_scopes)
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+@app.get("/api/integrations")
+def list_user_integrations(current_user: dict = Depends(get_current_user)):
+    """
+    Return the authenticated user's connection state for GitHub, GitLab, and Bitbucket.
+    Strictly isolated to current_user['id']. Never exposes tokens or secrets.
+    """
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ?",
+            (current_user["id"],),
+        ).fetchall()
+        by_provider = {r["provider"]: r for r in rows}
+
+    integrations = {
+        prov: _serialize_provider_connection(prov, by_provider.get(prov))
+        for prov in ("github", "gitlab", "bitbucket")
+    }
+    return {
+        "status": "success",
+        "user_id": current_user["id"],
+        "integrations": integrations,
+    }
+
+
+@app.post("/api/integrations/{provider}/connect")
+def connect_repository_provider(
+    provider: str,
+    payload: ProviderConnectPayload,
+    current_user: dict = Depends(get_current_user),
+):
+    prov = _validate_repo_provider(provider)
+    frontend_redirect = _ensure_strict_relative_redirect(
+        payload.redirect_path, default="/projects"
+    )
+
+    instance_url: Optional[str] = None
+    if prov == "gitlab":
+        try:
+            instance_url = validate_gitlab_instance_url(payload.instance_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Flow A: Direct Token Verification (verifies live against GitHub/GitLab/Bitbucket API)
+    if payload.access_token is not None:
+        raw_token = payload.access_token.strip()
+        if not raw_token:
+            raise HTTPException(status_code=400, detail="Access token cannot be empty.")
+
+        verification = _run_provider_verification(
+            prov,
+            access_token=raw_token,
+            instance_url=instance_url,
+            declared_scopes=payload.declared_scopes,
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        v_status = verification["status"]
+
+        with get_db_connection() as conn:
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=current_user["id"],
+                provider=prov,
+                status=v_status,
+                provider_account_id=verification.get("provider_account_id"),
+                provider_username=verification.get("provider_username"),
+                provider_email=verification.get("provider_email"),
+                instance_url=verification.get("instance_url") or instance_url,
+                scopes=verification.get("scopes"),
+                access_token=raw_token if v_status == "connected" else None,
+                repositories=verification.get("repositories"),
+                last_error=verification.get("error"),
+                last_verified_at=now_iso if v_status == "connected" else None,
+            )
+
+        if v_status != "connected":
+            http_code = (
+                401
+                if v_status == "token_expired_or_revoked"
+                else 403
+                if v_status == "permission_insufficient"
+                else 400
+            )
+            raise HTTPException(
+                status_code=http_code,
+                detail={
+                    "message": verification.get("error") or f"Failed to verify {prov} connection.",
+                    "integration": serialized,
+                },
+            )
+
+        return {
+            "status": "connected",
+            "integration": serialized,
+        }
+
+    # Flow B: Official OAuth 2.0 Authorization Redirect Flow
+    cfg = get_provider_oauth_config(prov)
+    if not cfg["configured"]:
+        with get_db_connection() as conn:
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=current_user["id"],
+                provider=prov,
+                status="authorization_failed",
+                instance_url=instance_url or cfg.get("instance_url"),
+                last_error=(
+                    f"{prov.capitalize()} OAuth client credentials ({', '.join(cfg['required_env'][:2])}) "
+                    f"are not configured on the backend server."
+                ),
+            )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": serialized["last_error"],
+                "integration": serialized,
+            },
+        )
+
+    state = f"st_{prov}_{secrets.token_urlsafe(32)}"
+    code_verifier, code_challenge = generate_pkce_pair()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=10)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_states (
+                state, provider, purpose, user_id, code_verifier,
+                redirect_uri, frontend_redirect, instance_url,
+                created_at, expires_at, consumed
+            )
+            VALUES (?, ?, 'repo_connect', ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                state,
+                prov,
+                current_user["id"],
+                code_verifier,
+                cfg["redirect_uri"],
+                frontend_redirect,
+                instance_url or cfg.get("instance_url"),
+                now.isoformat(),
+                expires.isoformat(),
+            ),
+        )
+        serialized = _upsert_provider_connection(
+            conn,
+            user_id=current_user["id"],
+            provider=prov,
+            status="connecting",
+            instance_url=instance_url or cfg.get("instance_url"),
+            last_error=None,
+        )
+
+    if prov == "github":
+        auth_url = build_github_authorize_url(state=state, code_challenge=code_challenge)
+    elif prov == "gitlab":
+        auth_url = build_gitlab_authorize_url(
+            state=state, code_challenge=code_challenge, instance_url=instance_url
+        )
+    else:
+        auth_url = build_bitbucket_authorize_url(state=state)
+
+    return {
+        "status": "connecting",
+        "provider": prov,
+        "authorization_url": auth_url,
+        "state": state,
+        "integration": serialized,
+    }
+
+
+@app.get("/api/integrations/{provider}/callback")
+def repository_provider_oauth_callback(
+    provider: str,
+    state: Optional[str] = Query(default=None),
+    code: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+    error_description: Optional[str] = Query(default=None),
+    response_mode: Optional[str] = Query(default="redirect"),
+):
+    prov = _validate_repo_provider(provider)
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing OAuth state parameter.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        state_row = conn.execute(
+            """
+            SELECT * FROM oauth_states
+            WHERE state = ? AND provider = ? AND purpose = 'repo_connect'
+            """,
+            (state, prov),
+        ).fetchone()
+
+        if not state_row:
+            raise HTTPException(status_code=400, detail="Invalid OAuth callback state parameter.")
+        if state_row["consumed"] == 1:
+            raise HTTPException(status_code=400, detail="OAuth state has already been consumed.")
+        if state_row["expires_at"] < now_iso:
+            raise HTTPException(status_code=400, detail="OAuth state has expired.")
+
+        conn.execute("UPDATE oauth_states SET consumed = 1 WHERE state = ?", (state,))
+        user_id = state_row["user_id"]
+        code_verifier = state_row["code_verifier"]
+        frontend_redirect = state_row["frontend_redirect"]
+        instance_url = state_row["instance_url"]
+
+        if error:
+            err_msg = error_description or f"{prov.capitalize()} authorization was denied ({error})."
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=user_id,
+                provider=prov,
+                status="authorization_failed",
+                instance_url=instance_url,
+                last_error=err_msg,
+            )
+            if response_mode == "redirect":
+                fe = get_frontend_base_url()
+                qs = urllib.parse.urlencode({"integration_error": err_msg, "provider": prov})
+                return RedirectResponse(url=f"{fe}{frontend_redirect}?{qs}", status_code=302)
+            raise HTTPException(
+                status_code=401,
+                detail={"message": err_msg, "integration": serialized},
+            )
+
+        if not code:
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=user_id,
+                provider=prov,
+                status="authorization_failed",
+                instance_url=instance_url,
+                last_error="Authorization callback did not include an authorization code.",
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={"message": serialized["last_error"], "integration": serialized},
+            )
+
+    # Exchange authorization code for access token on the backend
+    try:
+        if prov == "github":
+            token_data = exchange_github_code(code=code, code_verifier=code_verifier, state=state)
+        elif prov == "gitlab":
+            token_data = exchange_gitlab_code(
+                code=code, code_verifier=code_verifier, instance_url=instance_url
+            )
+        else:
+            token_data = exchange_bitbucket_code(code=code)
+    except ProviderHTTPError as exc:
+        err_msg = (
+            exc.body.get("detail")
+            if isinstance(exc.body, dict) and exc.body.get("detail")
+            else f"Failed to exchange {prov} authorization code."
+        )
+        with get_db_connection() as conn:
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=user_id,
+                provider=prov,
+                status="authorization_failed",
+                instance_url=instance_url,
+                last_error=str(err_msg),
+            )
+        if response_mode == "redirect":
+            fe = get_frontend_base_url()
+            qs = urllib.parse.urlencode({"integration_error": str(err_msg), "provider": prov})
+            return RedirectResponse(url=f"{fe}{frontend_redirect}?{qs}", status_code=302)
+        raise HTTPException(
+            status_code=401,
+            detail={"message": str(err_msg), "integration": serialized},
+        ) from exc
+
+    access_token = str(token_data["access_token"])
+    refresh_token = str(token_data["refresh_token"]) if token_data.get("refresh_token") else None
+    declared_scopes = str(token_data.get("scope") or token_data.get("scopes") or "")
+
+    # Verify repository access through provider's official API before marking connected
+    verification = _run_provider_verification(
+        prov,
+        access_token=access_token,
+        instance_url=instance_url,
+        declared_scopes=declared_scopes,
+    )
+    v_status = verification["status"]
+
+    with get_db_connection() as conn:
+        serialized = _upsert_provider_connection(
+            conn,
+            user_id=user_id,
+            provider=prov,
+            status=v_status,
+            provider_account_id=verification.get("provider_account_id"),
+            provider_username=verification.get("provider_username"),
+            provider_email=verification.get("provider_email"),
+            instance_url=verification.get("instance_url") or instance_url,
+            scopes=verification.get("scopes"),
+            access_token=access_token if v_status == "connected" else None,
+            refresh_token=refresh_token if v_status == "connected" else None,
+            repositories=verification.get("repositories"),
+            last_error=verification.get("error"),
+            last_verified_at=now_iso if v_status == "connected" else None,
+        )
+
+    if v_status != "connected":
+        if response_mode == "redirect":
+            fe = get_frontend_base_url()
+            qs = urllib.parse.urlencode(
+                {
+                    "integration_error": verification.get("error") or "Verification failed",
+                    "provider": prov,
+                }
+            )
+            return RedirectResponse(url=f"{fe}{frontend_redirect}?{qs}", status_code=302)
+
+        http_code = (
+            401
+            if v_status == "token_expired_or_revoked"
+            else 403
+            if v_status == "permission_insufficient"
+            else 400
+        )
+        raise HTTPException(
+            status_code=http_code,
+            detail={"message": verification.get("error"), "integration": serialized},
+        )
+
+    if response_mode == "redirect":
+        fe = get_frontend_base_url()
+        qs = urllib.parse.urlencode(
+            {"integration_connected": prov, "integration_status": "connected"}
+        )
+        return RedirectResponse(url=f"{fe}{frontend_redirect}?{qs}", status_code=302)
+
+    return {
+        "status": "connected",
+        "integration": serialized,
+    }
+
+
+@app.post("/api/integrations/{provider}/verify")
+def verify_existing_provider_connection(
+    provider: str,
+    current_user: dict = Depends(get_current_user),
+):
+    prov = _validate_repo_provider(provider)
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+
+        if not row or not row["access_token"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{prov.capitalize()} is not currently connected for your account.",
+            )
+
+        stored_token = row["access_token"]
+        instance_url = row["instance_url"]
+        declared_scopes = row["scopes"]
+
+    verification = _run_provider_verification(
+        prov,
+        access_token=stored_token,
+        instance_url=instance_url,
+        declared_scopes=declared_scopes,
+    )
+    v_status = verification["status"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        serialized = _upsert_provider_connection(
+            conn,
+            user_id=current_user["id"],
+            provider=prov,
+            status=v_status,
+            provider_account_id=verification.get("provider_account_id") or row["provider_account_id"],
+            provider_username=verification.get("provider_username") or row["provider_username"],
+            provider_email=verification.get("provider_email") or row["provider_email"],
+            instance_url=verification.get("instance_url") or instance_url,
+            scopes=verification.get("scopes") or declared_scopes,
+            access_token=stored_token if v_status == "connected" else None,
+            repositories=verification.get("repositories"),
+            last_error=verification.get("error"),
+            last_verified_at=now_iso if v_status == "connected" else row["last_verified_at"],
+        )
+
+    if v_status != "connected":
+        http_code = 401 if v_status == "token_expired_or_revoked" else 403
+        raise HTTPException(
+            status_code=http_code,
+            detail={"message": verification.get("error"), "integration": serialized},
+        )
+
+    return {"status": "connected", "integration": serialized}
+
+
+@app.post("/api/integrations/{provider}/disconnect")
+def disconnect_repository_provider(
+    provider: str,
+    current_user: dict = Depends(get_current_user),
+):
+    prov = _validate_repo_provider(provider)
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+        instance_url = row["instance_url"] if row else None
+
+        serialized = _upsert_provider_connection(
+            conn,
+            user_id=current_user["id"],
+            provider=prov,
+            status="disconnected",
+            instance_url=instance_url,
+            access_token=None,
+            refresh_token=None,
+            repositories=[],
+            last_error=None,
+        )
+
+    return {"status": "disconnected", "integration": serialized}
+
+
+@app.get("/api/integrations/{provider}/repositories")
+def list_connected_provider_repositories(
+    provider: str,
+    refresh: bool = Query(default=False, description="Re-fetch live repositories from provider API"),
+    current_user: dict = Depends(get_current_user),
+):
+    prov = _validate_repo_provider(provider)
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+
+        if not row or row["status"] != "connected" or not row["access_token"]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: {prov.capitalize()} is not connected or authorized for your account.",
+            )
+
+        stored_token = row["access_token"]
+        instance_url = row["instance_url"]
+        declared_scopes = row["scopes"]
+        serialized = _serialize_provider_connection(prov, row)
+
+    if refresh:
+        verification = _run_provider_verification(
+            prov,
+            access_token=stored_token,
+            instance_url=instance_url,
+            declared_scopes=declared_scopes,
+        )
+        v_status = verification["status"]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with get_db_connection() as conn:
+            serialized = _upsert_provider_connection(
+                conn,
+                user_id=current_user["id"],
+                provider=prov,
+                status=v_status,
+                provider_account_id=verification.get("provider_account_id") or row["provider_account_id"],
+                provider_username=verification.get("provider_username") or row["provider_username"],
+                provider_email=verification.get("provider_email") or row["provider_email"],
+                instance_url=verification.get("instance_url") or instance_url,
+                scopes=verification.get("scopes") or declared_scopes,
+                access_token=stored_token if v_status == "connected" else None,
+                repositories=verification.get("repositories"),
+                selected_repo_full_name=row["selected_repo_full_name"] if v_status == "connected" else None,
+                selected_branch=row["selected_branch"] if v_status == "connected" else None,
+                last_error=verification.get("error"),
+                last_verified_at=now_iso if v_status == "connected" else row["last_verified_at"],
+            )
+        if v_status != "connected":
+            raise HTTPException(
+                status_code=401 if v_status == "token_expired_or_revoked" else 403,
+                detail=verification.get("error") or f"Failed to refresh {prov} repositories.",
+            )
+
+    return {
+        "status": "success",
+        "provider": prov,
+        "provider_username": serialized["provider_username"],
+        "accessible_repos_count": serialized["accessible_repos_count"],
+        "repositories": serialized["repositories"],
+        "selected_repo_full_name": serialized["selected_repo_full_name"],
+        "selected_branch": serialized["selected_branch"],
+    }
+
+
+@app.get("/api/integrations/{provider}/branches")
+def list_repository_branches(
+    provider: str,
+    repo: str | None = Query(None, description="Full repository name ('owner/repo' or 'group/project')"),
+    repo_full_name: str | None = Query(None, description="Alias for full repository name"),
+    current_user: dict = Depends(get_current_user),
+):
+    prov = _validate_repo_provider(provider)
+    resolved_repo = (repo or repo_full_name or "").strip()
+    if not resolved_repo or "/" not in resolved_repo:
+        raise HTTPException(status_code=400, detail="Valid 'owner/repo' parameter is required.")
+    repo_full_name = resolved_repo
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+        if not row or row["status"] != "connected" or not row["access_token"]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: {prov.capitalize()} is not connected for your account.",
+            )
+        stored_token = row["access_token"]
+        instance_url = row["instance_url"]
+
+    if prov == "github":
+        res = fetch_github_repo_branches(stored_token, repo_full_name)
+    elif prov == "gitlab":
+        res = fetch_gitlab_repo_branches(stored_token, repo_full_name, instance_url=instance_url)
+    else:
+        res = fetch_bitbucket_repo_branches(stored_token, repo_full_name)
+
+    if not res.get("ok"):
+        new_status = res.get("status", "permission_insufficient")
+        err_msg = res.get("error", f"Failed to fetch branches for {repo_full_name}.")
+        if new_status == "token_expired_or_revoked":
+            with get_db_connection() as conn:
+                _upsert_provider_connection(
+                    conn,
+                    user_id=current_user["id"],
+                    provider=prov,
+                    status="token_expired_or_revoked",
+                    instance_url=instance_url,
+                    access_token=None,
+                    repositories=[],
+                    last_error=err_msg,
+                )
+        raise HTTPException(
+            status_code=401 if new_status == "token_expired_or_revoked" else 403,
+            detail=err_msg,
+        )
+
+    return {
+        "status": "success",
+        "provider": prov,
+        "repository": repo_full_name,
+        "branches": res["branches"],
+    }
+
+
+@app.post("/api/integrations/{provider}/select")
+def select_connected_repository(
+    provider: str,
+    payload: RepositorySelectPayload,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Explicitly select a verified repository and branch for a connected provider account,
+    preserving the distinction between a connected provider account and the active target repository.
+    """
+    prov = _validate_repo_provider(provider)
+    repo_full_name = payload.repo_full_name.strip()
+    if not repo_full_name or "/" not in repo_full_name:
+        raise HTTPException(
+            status_code=400,
+            detail="A valid repository identifier ('owner/repo' or 'group/project') is required.",
+        )
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+        if not row or row["status"] != "connected" or not row["access_token"]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"{prov.capitalize()} is not connected for your account.",
+            )
+        stored_token = row["access_token"]
+        instance_url = row["instance_url"]
+
+    if prov == "github":
+        check = verify_github_single_repo(stored_token, repo_full_name)
+    elif prov == "gitlab":
+        check = verify_gitlab_single_repo(stored_token, repo_full_name, instance_url=instance_url)
+    else:
+        check = verify_bitbucket_single_repo(stored_token, repo_full_name)
+
+    if not check.get("ok"):
+        new_status = check.get("status", "permission_insufficient")
+        err_msg = check.get("error", f"Failed to verify access to {repo_full_name}.")
+        if new_status == "token_expired_or_revoked":
+            with get_db_connection() as conn:
+                _upsert_provider_connection(
+                    conn,
+                    user_id=current_user["id"],
+                    provider=prov,
+                    status="token_expired_or_revoked",
+                    instance_url=instance_url,
+                    access_token=None,
+                    repositories=[],
+                    last_error=err_msg,
+                )
+        raise HTTPException(
+            status_code=401 if new_status == "token_expired_or_revoked" else 403,
+            detail=err_msg,
+        )
+
+    repo_meta = check["repo"]
+    chosen_branch = (payload.branch or "").strip() or repo_meta["default_branch"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE provider_connections
+            SET selected_repo_full_name = ?, selected_branch = ?, updated_at = ?
+            WHERE user_id = ? AND provider = ?
+            """,
+            (repo_meta["full_name"], chosen_branch, now_iso, current_user["id"], prov),
+        )
+        updated_row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+        serialized = _serialize_provider_connection(prov, updated_row)
+
+    return {
+        "status": "selected",
+        "provider": prov,
+        "selected_repo_full_name": repo_meta["full_name"],
+        "selected_branch": chosen_branch,
+        "integration": serialized,
+    }
+
+
+@app.post("/api/repositories/scan")
+def scan_connected_repository(
+    payload: RepositoryScanPayload,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Execute a repository scan ONLY when the backend has verified live repository
+    access for the current authenticated user's connected provider.
+    """
+    prov = _validate_repo_provider(payload.provider)
+    repo_full_name = payload.repo_full_name.strip()
+    if not repo_full_name or "/" not in repo_full_name:
+        raise HTTPException(
+            status_code=400,
+            detail="A valid repository identifier ('owner/repo' or 'group/project') is required.",
+        )
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_connections WHERE user_id = ? AND provider = ?",
+            (current_user["id"], prov),
+        ).fetchone()
+
+        if not row or row["status"] != "connected" or not row["access_token"]:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Cannot run repository scan: {prov.capitalize()} is not connected "
+                    f"or authorized for your account."
+                ),
+            )
+
+        stored_token = row["access_token"]
+        instance_url = row["instance_url"]
+
+    if prov == "github":
+        check = verify_github_single_repo(stored_token, repo_full_name)
+    elif prov == "gitlab":
+        check = verify_gitlab_single_repo(stored_token, repo_full_name, instance_url=instance_url)
+    else:
+        check = verify_bitbucket_single_repo(stored_token, repo_full_name)
+
+    if not check.get("ok"):
+        new_status = check.get("status", "permission_insufficient")
+        err_msg = check.get("error", f"Failed to verify access to {repo_full_name}.")
+        with get_db_connection() as conn:
+            if new_status == "token_expired_or_revoked":
+                _upsert_provider_connection(
+                    conn,
+                    user_id=current_user["id"],
+                    provider=prov,
+                    status="token_expired_or_revoked",
+                    instance_url=instance_url,
+                    access_token=None,
+                    repositories=[],
+                    last_error=err_msg,
+                )
+        http_code = 401 if new_status == "token_expired_or_revoked" else 403
+        raise HTTPException(status_code=http_code, detail=err_msg)
+
+    repo_meta = check["repo"]
+    chosen_branch = (payload.branch or "").strip() or repo_meta["default_branch"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE provider_connections
+            SET selected_repo_full_name = ?, selected_branch = ?, last_verified_at = ?, updated_at = ?
+            WHERE user_id = ? AND provider = ?
+            """,
+            (repo_meta["full_name"], chosen_branch, now_iso, now_iso, current_user["id"], prov),
+        )
+    return {
+        "status": "scan_verified_and_completed",
+        "scan_id": f"scan_{uuid.uuid4().hex[:10]}",
+        "provider": prov,
+        "repository": repo_meta["full_name"],
+        "branch": chosen_branch,
+        "private": repo_meta["private"],
+        "language": repo_meta["language"],
+        "verified_by_user_id": current_user["id"],
+        "timestamp": now_iso,
+    }
+
+
+# ============================================================================
+# 3. Demo Booking Submission & User/Admin Booking Endpoints
+# ============================================================================
+
+
+@app.post("/api/demo-requests")
+@app.post("/api/bookings")
+def create_demo_request(
+    req: DemoBookingCreatePayload,
+    optional_user: Optional[dict] = Depends(get_optional_user),
+):
+    full_name = req.full_name.strip()
+    work_email = req.work_email.strip().lower()
+    company = req.company.strip() if req.company else None
+    team_size = req.team_size.strip() if req.team_size else None
+    preferred_date = (req.preferred_date or "").strip()
+    preferred_time = (req.preferred_time or "10:00").strip()
+    tz = (req.timezone or "UTC").strip()
+    message = (req.message or req.additional_notes or "").strip() or None
+
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    if not work_email or not EMAIL_REGEX.match(work_email):
+        raise HTTPException(status_code=400, detail="A valid work email is required")
+    if not preferred_date:
+        raise HTTPException(
+            status_code=400, detail="Preferred date is required (YYYY-MM-DD)"
+        )
+    if not preferred_time:
+        raise HTTPException(
+            status_code=400, detail="Preferred time is required (HH:MM)"
+        )
+    if not tz:
+        raise HTTPException(status_code=400, detail="Timezone is required")
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    five_mins_ago_iso = (now - timedelta(minutes=5)).isoformat()
+
+    with get_db_connection() as conn:
+        dup = conn.execute(
+            """
+            SELECT id FROM demo_bookings
+            WHERE lower(work_email) = ?
+              AND preferred_date = ?
+              AND preferred_time = ?
+              AND status = 'Pending'
+              AND created_at >= ?
+            """,
+            (work_email, preferred_date, preferred_time, five_mins_ago_iso),
+        ).fetchone()
+        if dup:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A pending demo request ({dup['id']}) for {preferred_date} at {preferred_time} was already submitted recently.",
+            )
+
+        user_id = optional_user["id"] if optional_user else None
+        if not user_id:
+            matching_user = conn.execute(
+                "SELECT id FROM users WHERE email = ?", (work_email,)
+            ).fetchone()
+            if matching_user:
+                user_id = matching_user["id"]
+
+        booking_id = f"req_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO demo_bookings (
+                id, user_id, full_name, work_email, company, team_size,
+                preferred_date, preferred_time, timezone, message,
+                status, admin_notes, confirmed_datetime, email_notification_status,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', NULL, NULL, 'not_configured', ?, ?)
+            """,
+            (
+                booking_id,
+                user_id,
+                full_name,
+                work_email,
+                company,
+                team_size,
+                preferred_date,
+                preferred_time,
+                tz,
+                message,
+                now_iso,
+                now_iso,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, NULL, 'Pending', ?, ?, 'Initial demo request submitted.', ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                user_id,
+                optional_user["email"] if optional_user else work_email,
+                now_iso,
+            ),
+        )
+
+        booking_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, booking_row)
+
+        notif_status, notif_msg = send_admin_booking_notification(booking_dict)
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "received",
+        "request_id": booking_id,
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+        "message": (
+            "Demo request received and saved with status 'Pending'. "
+            "Please note: this is a received request, not yet a confirmed appointment. "
+            "An administrator will confirm or reschedule your slot."
+        ),
+    }
+
+
+@app.get("/api/my/bookings")
+def list_my_bookings(current_user: dict = Depends(get_current_user)):
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM demo_bookings
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            """,
+            (current_user["id"],),
+        ).fetchall()
+        bookings = [_serialize_booking(conn, r) for r in rows]
+
+    return {
+        "status": "success",
+        "count": len(bookings),
+        "bookings": bookings,
+    }
+
+
+@app.get("/api/my/bookings/{booking_id}")
+def get_my_booking_detail(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row or row["user_id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You do not have permission to view this booking.",
+            )
+        booking = _serialize_booking(conn, row)
+
+    return {"status": "success", "booking": booking}
+
+
+@app.get("/api/admin/bookings")
+def admin_list_bookings(
+    status: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    _admin: dict = Depends(require_admin),
+):
+    query = "SELECT * FROM demo_bookings WHERE 1=1"
+    params: list = []
+
+    if status and status != "All":
+        query += " AND status = ?"
+        params.append(status)
+
+    if search and search.strip():
+        q = f"%{search.strip().lower()}%"
+        query += """ AND (
+            lower(full_name) LIKE ? OR
+            lower(work_email) LIKE ? OR
+            lower(coalesce(company, '')) LIKE ? OR
+            lower(id) LIKE ?
+        )"""
+        params.extend([q, q, q, q])
+
+    query += " ORDER BY created_at DESC"
+
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        bookings = [_serialize_booking(conn, r) for r in rows]
+
+    return {
+        "status": "success",
+        "count": len(bookings),
+        "bookings": bookings,
+    }
+
+
+@app.get("/api/admin/bookings/{booking_id}")
+def admin_get_booking(
+    booking_id: str,
+    _admin: dict = Depends(require_admin),
+):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+        booking = _serialize_booking(conn, row)
+
+    return {"status": "success", "booking": booking}
+
+
+@app.patch("/api/admin/bookings/{booking_id}")
+def admin_update_booking(
+    booking_id: str,
+    payload: AdminBookingUpdatePayload,
+    admin_user: dict = Depends(require_admin),
+):
+    new_status = payload.status.strip()
+    if new_status not in ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{new_status}'. Allowed: {', '.join(sorted(ALLOWED_STATUSES))}",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        existing = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        prev_status = existing["status"]
+        admin_notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes is not None
+            else existing["admin_notes"]
+        )
+        confirmed_dt = (
+            payload.confirmed_datetime.strip()
+            if payload.confirmed_datetime is not None
+            else existing["confirmed_datetime"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = ?, admin_notes = ?, confirmed_datetime = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_status, admin_notes, confirmed_dt, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                prev_status,
+                new_status,
+                admin_user["id"],
+                admin_user["email"],
+                admin_notes or f"Status updated from {prev_status} to {new_status}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking = _serialize_booking(conn, updated_row)
+
+    return {"status": "success", "booking": booking}
