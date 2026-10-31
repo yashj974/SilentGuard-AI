@@ -17,13 +17,15 @@ import { useWorkspace } from '../context/useWorkspace';
 
 export const ProjectDetailsPage: React.FC = () => {
   const navigate = useNavigate();
-  const { selectedProject, uiState, setUiState } = useWorkspace();
+  const { selectedProject, uiState, setUiState, isDemoData, overviewData } = useWorkspace();
 
   if (uiState === 'loading') return <LoadingSkeleton />;
   if (uiState === 'empty') return <EmptyState onAction={() => setUiState('demo')} />;
   if (uiState === 'error') return <ErrorState onRetry={() => setUiState('demo')} />;
 
-  const modules = DEMO_OVERVIEW_DATA.highestRiskModules;
+  const modules = overviewData?.highestRiskModules && overviewData.highestRiskModules.length > 0
+    ? overviewData.highestRiskModules
+    : (isDemoData ? DEMO_OVERVIEW_DATA.highestRiskModules : []);
 
   return (
     <div className="space-y-5">
@@ -35,7 +37,13 @@ export const ProjectDetailsPage: React.FC = () => {
               <h1 className="font-mono text-lg font-bold text-white">
                 {selectedProject.name} ({selectedProject.key})
               </h1>
-              <Badge variant="demo" size="sm" />
+              {isDemoData ? (
+                <Badge variant="demo" size="sm" />
+              ) : (
+                <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                  REAL REPOSITORY SCAN
+                </span>
+              )}
               <Badge
                 variant="status"
                 status={selectedProject.debtScore >= 80 ? 'passed' : 'warning'}
@@ -108,10 +116,10 @@ export const ProjectDetailsPage: React.FC = () => {
         />
         <MetricCard
           title="Change Fragility (CFI)"
-          value={DEMO_OVERVIEW_DATA.fragility.score}
+          value={overviewData?.fragility?.score ?? DEMO_OVERVIEW_DATA.fragility.score}
           trend="degrading"
-          changeDelta={DEMO_OVERVIEW_DATA.fragility.level}
-          subtitle={DEMO_OVERVIEW_DATA.fragility.blastRadius}
+          changeDelta={overviewData?.fragility?.level ?? DEMO_OVERVIEW_DATA.fragility.level}
+          subtitle={overviewData?.fragility?.blastRadius ?? DEMO_OVERVIEW_DATA.fragility.blastRadius}
           icon={<GitFork className="h-4 w-4 text-[#FF5722]" />}
           onClick={() => navigate('/change-impact')}
         />
@@ -128,12 +136,25 @@ export const ProjectDetailsPage: React.FC = () => {
               File-level risk scores, LOC, AI authorship ratio, and downstream blast radius.
             </p>
           </div>
-          <Badge variant="demo" size="sm" />
+          {isDemoData ? (
+            <Badge variant="demo" size="sm" />
+          ) : (
+            <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+              {modules.length} MODULES
+            </span>
+          )}
         </div>
 
-        <div className="mt-5 space-y-3">
-          {modules.map((mod) => (
-            <div key={mod.id} className="bento-inner-card p-5">
+        {modules.length === 0 ? (
+          <div className="mt-5 rounded-2xl border border-white/[0.06] bg-black/40 p-8 text-center">
+            <p className="font-mono text-xs text-zinc-400">
+              No high-risk modules identified. All analyzed source files meet architectural boundaries.
+            </p>
+          </div>
+        ) : (
+          <div className="mt-5 space-y-3">
+            {modules.map((mod) => (
+              <div key={mod.id} className="bento-inner-card p-5">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <div className="flex flex-wrap items-center gap-2.5">
@@ -194,6 +215,7 @@ export const ProjectDetailsPage: React.FC = () => {
             </div>
           ))}
         </div>
+        )}
       </div>
     </div>
   );

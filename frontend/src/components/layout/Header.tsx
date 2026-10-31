@@ -16,7 +16,7 @@ import {
   LogOut,
   ShieldCheck,
 } from 'lucide-react';
-import { DEMO_PROJECTS, DEMO_OVERVIEW_DATA } from '../../data/demoData';
+import { DEMO_OVERVIEW_DATA } from '../../data/demoData';
 import { useWorkspace } from '../../context/useWorkspace';
 import { useAuth } from '../../context/useAuth';
 import { useTheme } from '../../theme/useTheme';
@@ -33,6 +33,9 @@ export const Header: React.FC = () => {
     globalSearch,
     setGlobalSearch,
     backendStatus,
+    isDemoData,
+    availableProjects,
+    hasRealScans,
   } = useWorkspace();
   const { user, logout } = useAuth();
   const { resolvedTheme, setThemeMode } = useTheme();
@@ -161,55 +164,83 @@ export const Header: React.FC = () => {
         <div className="relative">
           <button
             onClick={() => setProjectDropdownOpen(!projectDropdownOpen)}
-            className="bento-pill-input flex h-10 items-center gap-2 rounded-2xl px-3.5 text-xs font-medium text-zinc-200 hover:border-white/20 transition-all"
+            className="bento-pill-input flex h-10 items-center gap-2 rounded-2xl px-3.5 text-xs font-medium text-zinc-200 hover:border-white/20 transition-all cursor-pointer"
             title="Switch Active Repository Context"
           >
             <FolderGit2 className="h-3.5 w-3.5 text-[#FF5722]" />
-            <span className="font-mono font-semibold text-white">{selectedProject.key}</span>
+            <span className="font-mono font-semibold text-white max-w-[170px] truncate">
+              {selectedProject.key}
+            </span>
             <span className="hidden md:inline-flex items-center gap-1 rounded-lg bg-white/[0.05] px-2 py-0.5 font-mono text-[10px] text-zinc-400">
-              <GitBranch className="h-2.5 w-2.5" />
+              <GitBranch className="h-2.5 w-2.5 text-[#FF5722]" />
               {selectedProject.branch} • {selectedProject.latestCommit}
             </span>
             <ChevronDown className="h-3.5 w-3.5 text-zinc-400" />
           </button>
 
           {projectDropdownOpen && (
-            <div className="bento-card absolute left-0 mt-2 w-72 rounded-2xl p-2 z-50">
-              <div className="px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                Select Repository (Sample Dataset)
+            <div className="bento-card absolute left-0 mt-2 w-80 rounded-2xl p-2 z-50 shadow-2xl">
+              <div className="px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400 flex items-center justify-between">
+                <span>Select Repository Context</span>
+                {hasRealScans && (
+                  <span className="text-[9px] text-emerald-400 font-normal">Real Scans Available</span>
+                )}
               </div>
-              <div className="space-y-1">
-                {DEMO_PROJECTS.map((proj) => (
-                  <button
-                    key={proj.key}
-                    onClick={() => {
-                      setSelectedProjectKey(proj.key);
-                      setProjectDropdownOpen(false);
-                    }}
-                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-xs transition-colors ${
-                      selectedProject.key === proj.key
-                        ? 'bg-white/[0.1] text-white font-semibold'
-                        : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200'
-                    }`}
-                  >
-                    <div className="flex flex-col items-start">
-                      <span className="font-mono text-xs text-white">{proj.key}</span>
-                      <span className="font-mono text-[10px] text-zinc-400">
-                        {proj.branch} • {proj.totalLoc.toLocaleString()} LOC
+              <div className="space-y-1 max-h-72 overflow-y-auto">
+                {availableProjects.map((proj) => {
+                  const isReal = proj.key.includes('/');
+                  return (
+                    <button
+                      key={proj.key}
+                      onClick={() => {
+                        setSelectedProjectKey(proj.key);
+                        setProjectDropdownOpen(false);
+                      }}
+                      className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-xs transition-colors cursor-pointer ${
+                        selectedProject.key === proj.key
+                          ? 'bg-white/[0.1] text-white font-semibold'
+                          : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200'
+                      }`}
+                    >
+                      <div className="flex flex-col items-start min-w-0 pr-2">
+                        <div className="flex items-center gap-1.5 w-full">
+                          <span className="font-mono text-xs text-white truncate max-w-[160px]">
+                            {proj.key}
+                          </span>
+                          {isReal ? (
+                            <span className="rounded bg-emerald-500/20 border border-emerald-500/30 px-1 py-0.2 font-mono text-[8px] font-semibold text-emerald-300">
+                              Connected
+                            </span>
+                          ) : (
+                            <span className="rounded bg-zinc-700/40 border border-zinc-600/30 px-1 py-0.2 font-mono text-[8px] font-semibold text-zinc-400">
+                              Demo
+                            </span>
+                          )}
+                        </div>
+                        <span className="font-mono text-[10px] text-zinc-400 mt-0.5">
+                          {proj.branch} • {proj.totalLoc > 0 ? `${proj.totalLoc.toLocaleString()} LOC` : 'Unscanned'}
+                        </span>
+                      </div>
+                      <span className="rounded-lg bg-white/[0.06] px-2 py-0.5 font-mono text-[11px] font-bold text-[#FF5722] shrink-0">
+                        {proj.debtScore} ({proj.grade})
                       </span>
-                    </div>
-                    <span className="rounded-lg bg-white/[0.06] px-2 py-0.5 font-mono text-[11px] font-bold text-[#FF5722]">
-                      {proj.debtScore} ({proj.grade})
-                    </span>
-                  </button>
-                ))}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           )}
         </div>
 
-        {/* Unmistakable Demo Data Badge */}
-        <Badge variant="demo" size="sm" />
+        {/* Unmistakable Demo vs Verified Real Scan Badge */}
+        {isDemoData ? (
+          <Badge variant="demo" size="sm" />
+        ) : (
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-3 py-1 font-mono text-[10px] font-semibold text-emerald-300 shadow-sm">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span>REAL REPOSITORY SCAN ({selectedProject.branch})</span>
+          </span>
+        )}
       </div>
 
       {/* Right: UI State Switcher, Engine Status, Theme, Home & Authenticated User Control */}

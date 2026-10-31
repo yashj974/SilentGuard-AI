@@ -35,6 +35,12 @@ export const OverviewPage: React.FC = () => {
     setUiState,
     appliedScoreBonus,
     remediationStates,
+    overviewData,
+    findings,
+    isDemoData,
+    hasRealScans,
+    selectedRepo,
+    startRepositoryScan,
   } = useWorkspace();
 
   const [scanTab, setScanTab] = useState<'all' | 'passed' | 'attention'>('all');
@@ -51,7 +57,7 @@ export const OverviewPage: React.FC = () => {
     return <ErrorState onRetry={() => setUiState('demo')} />;
   }
 
-  const data = DEMO_OVERVIEW_DATA;
+  const data = overviewData || DEMO_OVERVIEW_DATA;
   const effectiveScore = Math.min(100, selectedProject.debtScore + appliedScoreBonus);
   const effectiveGrade =
     effectiveScore >= 85
@@ -62,7 +68,8 @@ export const OverviewPage: React.FC = () => {
       ? 'C'
       : 'D';
 
-  const cats = selectedProject.categories;
+  const cats = selectedProject.categories || data.categories;
+  const displayFindings = findings && findings.length > 0 ? findings.slice(0, 6) : data.highestPriorityFindings;
 
   const filteredScans = data.recentScans.filter((scan) => {
     if (scanTab === 'passed') return scan.status === 'passed';
@@ -72,6 +79,34 @@ export const OverviewPage: React.FC = () => {
 
   return (
     <div className="space-y-5">
+      {/* Ready-to-scan Prompt when Selected Repo is unscanned */}
+      {!hasRealScans && selectedRepo && (
+        <div className="bento-card animate-bento-in p-6 border border-[#FF5722]/40 bg-gradient-to-r from-[#FF5722]/10 to-transparent flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-xs font-bold text-[#FF5722] uppercase">
+                READY FOR ANALYSIS
+              </span>
+              <span className="rounded-full bg-amber-500/20 border border-amber-500/30 px-2 py-0.5 font-mono text-[10px] text-amber-300">
+                Pending Initial Scan
+              </span>
+            </div>
+            <h2 className="text-base font-semibold text-white mt-1">
+              {selectedRepo.repo_full_name} ({selectedRepo.branch}) is ready for inspection
+            </h2>
+            <p className="text-xs text-zinc-300 mt-0.5">
+              Run a verified static code scan to identify security vulnerabilities, reliability concerns, and technical debt in real repository files.
+            </p>
+          </div>
+          <button
+            onClick={() => void startRepositoryScan()}
+            className="rounded-xl bg-[#FF5722] hover:bg-[#e64a19] px-4 py-2.5 font-mono text-xs font-semibold text-white shadow-md transition-all shrink-0 cursor-pointer flex items-center gap-1.5"
+          >
+            <span>Start Code Scan</span>
+          </button>
+        </div>
+      )}
+
       {/* Top Row: Silent Debt Score + 4 Core Risk Dimensions (5 Compact Bento Cards) */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
         {/* Card 1: Composite Silent Debt Score & Grade */}
@@ -154,7 +189,13 @@ export const OverviewPage: React.FC = () => {
                   <h2 className="text-base font-semibold tracking-tight text-white">
                     Historical Risk &amp; Debt Trend
                   </h2>
-                  <Badge variant="demo" size="sm" />
+                  {isDemoData ? (
+                    <Badge variant="demo" size="sm" />
+                  ) : (
+                    <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                      REAL SCAN EVIDENCE
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 text-xs text-zinc-400">
                   7-interval posture trajectory for <span className="font-mono text-zinc-200">{selectedProject.key}</span> ({selectedProject.aiRatio}% AI-assisted LOC)
@@ -427,7 +468,7 @@ export const OverviewPage: React.FC = () => {
             </div>
 
             <div className="mt-5 space-y-3.5">
-              {data.highestPriorityFindings.map((finding) => {
+              {displayFindings.map((finding) => {
                 const remState = remediationStates[finding.id];
                 const isApplied = remState === 'verified_applied';
 

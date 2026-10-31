@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   CheckCircle2,
   Sparkles,
@@ -25,15 +25,24 @@ export const RemediationLabPage: React.FC = () => {
     applyRemediation,
     resetRemediations,
     appliedScoreBonus,
+    findings: allFindings,
+    isDemoData,
+    hasRealScans,
   } = useWorkspace();
 
   const [queueFilter, setQueueFilter] = useState<'all' | 'proposed' | 'approved' | 'verified_applied'>('all');
 
+  const findings = useMemo(() => {
+    if (!isDemoData && hasRealScans && allFindings.length > 0) {
+      const fixable = allFindings.filter((f) => f.verifiedFixAvailable || f.remediationDiff);
+      return fixable.length > 0 ? fixable : allFindings;
+    }
+    return DEMO_OVERVIEW_DATA.highestPriorityFindings;
+  }, [isDemoData, hasRealScans, allFindings]);
+
   if (uiState === 'loading') return <LoadingSkeleton />;
   if (uiState === 'empty') return <EmptyState onAction={() => setUiState('demo')} />;
   if (uiState === 'error') return <ErrorState onRetry={() => setUiState('demo')} />;
-
-  const findings = DEMO_OVERVIEW_DATA.highestPriorityFindings;
   const baselineScore = selectedProject.debtScore;
   const afterScore = Math.min(100, baselineScore + appliedScoreBonus);
 
@@ -95,7 +104,13 @@ export const RemediationLabPage: React.FC = () => {
               <h1 className="text-base font-semibold tracking-tight text-white">
                 Remediation Lab &amp; Before/After Re-Analysis
               </h1>
-              <Badge variant="demo" size="sm" />
+              {isDemoData ? (
+                <Badge variant="demo" size="sm" />
+              ) : (
+                <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 font-mono text-[9px] font-semibold text-emerald-300">
+                  {findings.length} Actionable Findings
+                </span>
+              )}
             </div>
             <p className="mt-1 text-xs text-zinc-400">
               Inspect suggested diffs, explicitly approve patches, and run before/after score re-analysis.

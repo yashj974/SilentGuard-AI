@@ -15,6 +15,7 @@ import {
   Check,
 } from 'lucide-react';
 import { useAuth } from '../../context/useAuth';
+import { useWorkspace } from '../../context/useWorkspace';
 
 type ProviderStatus =
   | 'not_connected'
@@ -124,6 +125,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
   redirectPath = '/integrations',
 }) => {
   const { token, user } = useAuth();
+  const { refreshWorkspaceSummary } = useWorkspace();
   const [searchParams, setSearchParams] = useSearchParams();
   const [integrations, setIntegrations] = useState<
     Record<'github' | 'gitlab' | 'bitbucket', ProviderIntegrationState> | null
@@ -442,6 +444,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
       } else {
         await fetchIntegrations();
       }
+      await refreshWorkspaceSummary();
     } finally {
       setBusyProvider(null);
     }
@@ -464,6 +467,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
       } else {
         await fetchIntegrations();
       }
+      await refreshWorkspaceSummary();
     } finally {
       setBusyProvider(null);
     }
@@ -485,6 +489,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
       } else {
         await fetchIntegrations();
       }
+      await refreshWorkspaceSummary();
     } finally {
       setBusyProvider(null);
     }
@@ -521,6 +526,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
         return;
       }
       await fetchIntegrations();
+      await refreshWorkspaceSummary();
       setScanResult({
         status: 'success',
         repo: repoFullName,

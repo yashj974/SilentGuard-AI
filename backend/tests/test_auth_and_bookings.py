@@ -912,6 +912,59 @@ def test_GitHubGitLabBitbucketAll10Scenarios(client: TestClient):
         assert scan_payload["verified_by_user_id"] == user_a_id
         assert scan_payload["repository"] == "alice-gh/silentguard-core"
         assert scan_payload["branch"] == "develop"
+        scan_id_a = scan_payload["scan_id"]
+        assert scan_payload["findings_count"] > 0
+        assert scan_payload["debt_score"] > 0
+
+        # Verify scan record & findings persistence via API
+        res_latest = client.get(
+            "/api/scans/latest",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert res_latest.status_code == 200
+        latest_data = res_latest.json()
+        assert latest_data["has_scan"] is True
+        assert latest_data["scan"]["id"] == scan_id_a
+
+        res_findings = client.get(
+            f"/api/scans/{scan_id_a}/findings",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert res_findings.status_code == 200
+        findings_list = res_findings.json()["findings"]
+        assert len(findings_list) == scan_payload["findings_count"]
+        first_finding = findings_list[0]
+        assert "ruleId" in first_finding
+        assert "filePath" in first_finding
+        assert "line" in first_finding
+
+        # User B cannot read User A's scan details (Isolation check)
+        res_b_read_scan = client.get(
+            f"/api/scans/{scan_id_a}",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert res_b_read_scan.status_code == 404
+
+        # Verify workspace summary delivers real scan results
+        res_summary = client.get(
+            "/api/workspace/summary",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert res_summary.status_code == 200
+        sum_data = res_summary.json()
+        assert sum_data["has_scans"] is True
+        assert sum_data["is_demo"] is False
+        assert sum_data["active_project"]["repo"] == "alice-gh/silentguard-core"
+        assert sum_data["overview"]["silentDebtScore"] == scan_payload["debt_score"]
+
+        # Test finding remediation patch
+        res_rem = client.patch(
+            f"/api/findings/{first_finding['id']}/remediation",
+            headers={"Authorization": f"Bearer {token_a}"},
+            json={"status": "approved"},
+        )
+        assert res_rem.status_code == 200
+        assert res_rem.json()["remediation_status"] == "approved"
 
         # ------------------------------------------------------------------
         # SCENARIO 6: Token revocation -> transitions to token_expired_or_revoked -> Reconnect restores connected

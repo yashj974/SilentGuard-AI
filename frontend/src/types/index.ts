@@ -3,6 +3,88 @@ export type DebtCategory = 'security' | 'reliability' | 'maintainability' | 'arc
 export type ScanStatus = 'passed' | 'warning' | 'failed' | 'in_progress';
 export type SignalType = 'confirmed_ast' | 'heuristic_signal';
 export type RemediationState = 'proposed' | 'approved' | 'verified_applied' | 'manual_only';
+export type ReviewStatus =
+  | 'open'
+  | 'under_review'
+  | 'fix_proposed'
+  | 'approved'
+  | 'rejected'
+  | 'applied'
+  | 'verified_resolved'
+  | 'reopened';
+
+export interface AIExplanation {
+  provider: string;
+  ruleId?: string;
+  title?: string;
+  filePath?: string;
+  line?: number;
+  cwe?: string;
+  severity?: string;
+  what_happened: string;
+  where_happened: string;
+  why_it_matters: string;
+  potential_impact: string;
+  how_to_fix: string;
+  beginner_explanation: string;
+  technical_explanation: string;
+  validation_steps: string[];
+  side_effects?: string;
+  confidence_evidence?: string;
+}
+
+export interface SuggestedFix {
+  findingId: string;
+  ruleId: string;
+  filePath: string;
+  line: number;
+  removedLines: string[];
+  addedLines: string[];
+  diffUnified: string;
+  explanation: string;
+  sideEffects: string;
+  validationSteps: string[];
+  scoreImpactPts: number;
+  testSuiteResult: string;
+  canApplyAutomatically?: boolean;
+}
+
+export interface FindingReviewHistoryItem {
+  id: string;
+  finding_id: string;
+  action: string;
+  from_status?: string;
+  to_status?: string;
+  user_name: string;
+  user_email: string;
+  note?: string;
+  created_at: string;
+}
+
+export interface RepositoryReviewSummary {
+  status: string;
+  scan_id: string;
+  repository: string;
+  branch: string;
+  commit_sha?: string;
+  completed_at: string;
+  overallHealthScore: number;
+  debtGrade: string;
+  totalFindings: number;
+  severityCounts: { critical: number; high: number; medium: number; low: number; info: number };
+  requiresReviewCount: number;
+  topSecurityIssues: Finding[];
+  topReliabilityIssues: Finding[];
+  topMaintainabilityIssues: Finding[];
+  topArchitecturalIssues: Finding[];
+  topRecommendedActions: string[];
+  changesSincePreviousScan?: {
+    previousScanId: string;
+    previousTimestamp: string;
+    debtScoreDelta: number;
+    findingsDelta: number;
+  } | null;
+}
 
 export interface Finding {
   id: string;
@@ -33,6 +115,18 @@ export interface Finding {
   description: string;
   verifiedFixAvailable: boolean;
   status: 'open' | 'triaged' | 'resolved' | 'suppressed';
+  reviewStatus?: ReviewStatus;
+  reviewedByName?: string;
+  reviewedAt?: string;
+  whatHappened?: string;
+  whereHappened?: string;
+  whyItMatters?: string;
+  potentialImpact?: string;
+  howToFix?: string;
+  beginnerExplanation?: string;
+  technicalExplanation?: string;
+  confidenceEvidence?: string;
+  validationSteps?: string[];
   lifecycle?: 'newly_detected' | 'recurring' | 'open' | 'resolved';
   detectedAt: string;
 }

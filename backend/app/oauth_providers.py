@@ -128,6 +128,10 @@ def set_http_transport(transport: Optional[HttpTransport]) -> None:
     _active_http_transport = transport or _default_http_request
 
 
+def is_mock_http_active() -> bool:
+    return _active_http_transport != _default_http_request
+
+
 def http_request(
     method: str,
     url: str,

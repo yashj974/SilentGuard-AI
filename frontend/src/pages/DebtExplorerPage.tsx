@@ -31,6 +31,8 @@ export const DebtExplorerPage: React.FC = () => {
     setSelectedProjectKey,
     uiState,
     setUiState,
+    overviewData,
+    isDemoData,
   } = useWorkspace();
 
   const [categoryFilter, setCategoryFilter] = useState<'all' | DebtCategory>('all');
@@ -41,8 +43,8 @@ export const DebtExplorerPage: React.FC = () => {
   if (uiState === 'empty') return <EmptyState onAction={() => setUiState('demo')} />;
   if (uiState === 'error') return <ErrorState onRetry={() => setUiState('demo')} />;
 
-  const data = DEMO_OVERVIEW_DATA;
-  const cats = selectedProject.categories;
+  const data = overviewData || DEMO_OVERVIEW_DATA;
+  const cats = selectedProject.categories || data.categories;
 
   const filteredFingerprints = data.fingerprints.filter((fp) => {
     const matchCategory = categoryFilter === 'all' || fp.category === categoryFilter;
@@ -115,7 +117,13 @@ export const DebtExplorerPage: React.FC = () => {
           <div className="flex items-center gap-2 text-xs font-semibold text-white">
             <Filter className="h-4 w-4 text-[#FF5722]" />
             <span>Filter Silent Debt Explorer</span>
-            <Badge variant="demo" size="sm" />
+            {isDemoData ? (
+              <Badge variant="demo" size="sm" />
+            ) : (
+              <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                REAL SCAN EVIDENCE
+              </span>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 text-xs">
