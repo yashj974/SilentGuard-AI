@@ -686,7 +686,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
                     <span className="text-zinc-500 shrink-0">Callback URI:</span>
                     <code className="font-mono text-[10px] text-zinc-300 truncate">
                       {item?.redirect_uri ||
-                        `http://localhost:8001/api/integrations/${prov}/callback`}
+                        `http://localhost:8000/api/integrations/${prov}/callback`}
                     </code>
                   </div>
                   {item?.provider_username && (
@@ -736,7 +736,7 @@ export const RepositoryIntegrationsPanel: React.FC<{ redirectPath?: string }> = 
                         <code className="font-mono text-white">backend/.env</code> ({meta.consoleHint}) with callback{' '}
                         <code className="font-mono text-emerald-300">
                           {item.redirect_uri ||
-                            `http://localhost:8001/api/integrations/${prov}/callback`}
+                            `http://localhost:8000/api/integrations/${prov}/callback`}
                         </code>
                         , or verify a token below.
                       </p>

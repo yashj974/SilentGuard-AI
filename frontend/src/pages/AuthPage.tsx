@@ -73,7 +73,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signup' }) =>
             redirect_uri:
               typeof data.redirect_uri === 'string'
                 ? data.redirect_uri
-                : 'http://localhost:8001/api/auth/google/callback',
+                : 'http://localhost:8000/api/auth/google/callback',
             required_env: Array.isArray(data.required_env)
               ? data.required_env
               : ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'],
@@ -397,7 +397,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signup' }) =>
                         onClick={() => {
                           const uri =
                             googleConfigStatus?.redirect_uri ||
-                            'http://localhost:8001/api/auth/google/callback';
+                            'http://localhost:8000/api/auth/google/callback';
                           void navigator.clipboard.writeText(uri);
                           setCopiedRedirectUri(true);
                           setTimeout(() => setCopiedRedirectUri(false), 2000);
@@ -409,7 +409,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signup' }) =>
                     </div>
                     <code className="block font-mono text-[10px] text-emerald-300 break-all">
                       {googleConfigStatus?.redirect_uri ||
-                        'http://localhost:8001/api/auth/google/callback'}
+                        'http://localhost:8000/api/auth/google/callback'}
                     </code>
                   </div>
                   <p className="text-[10px] text-slate-400 leading-relaxed">

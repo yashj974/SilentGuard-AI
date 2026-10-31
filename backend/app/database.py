@@ -452,6 +452,37 @@ def init_db() -> None:
                 ("007_ai_code_review_and_audit", now_iso),
             )
 
+        if "008_demo_booking_management_enhancements" not in applied:
+            existing_demo_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(demo_bookings)").fetchall()
+            }
+            demo_new_cols = {
+                "meeting_url": "TEXT",
+                "confirmed_by_admin_id": "TEXT",
+                "confirmed_at": "TEXT",
+                "proposed_date": "TEXT",
+                "proposed_time": "TEXT",
+                "reschedule_reason": "TEXT",
+                "reschedule_status": "TEXT",
+                "rejection_reason": "TEXT",
+                "cancellation_reason": "TEXT",
+                "cancelled_by": "TEXT",
+                "cancelled_at": "TEXT",
+                "completed_at": "TEXT",
+            }
+            for col_name, col_type in demo_new_cols.items():
+                if col_name not in existing_demo_cols:
+                    conn.execute(f"ALTER TABLE demo_bookings ADD COLUMN {col_name} {col_type};")
+
+            # Normalize any existing demo_bookings status to lowercase
+            conn.execute("UPDATE demo_bookings SET status = lower(status) WHERE status IS NOT NULL;")
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                ("008_demo_booking_management_enhancements", now_iso),
+            )
+
         # Seed configured bootstrap admin account if not present
         bootstrap_email = (
             os.environ.get("SILENTGUARD_BOOTSTRAP_ADMIN_EMAIL", "admin@silentguard.ai")

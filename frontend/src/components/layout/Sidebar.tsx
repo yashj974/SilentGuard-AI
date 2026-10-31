@@ -66,8 +66,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggleCollapse })
     ...(user?.role === 'admin'
       ? [
           {
-            name: 'Admin Demo Requests',
-            path: '/admin/bookings',
+            name: 'Demo Requests',
+            path: '/admin/demo-requests',
             icon: ShieldCheck,
             badge: 'Admin',
           },

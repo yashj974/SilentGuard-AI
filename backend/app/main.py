@@ -1,5 +1,7 @@
 import hashlib
 import json
+import logging
+import os
 import re
 import secrets
 import urllib.parse
@@ -12,6 +14,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger("silentguard.main")
 
 from .database import (
     create_scan_record,
@@ -38,7 +42,14 @@ from .ai_engine import (
     apply_patch_to_file_content,
 )
 from .masking import mask_credentials_in_text
-from .notifications import send_admin_booking_notification
+from .notifications import (
+    send_admin_booking_notification,
+    send_booking_received_notification,
+    send_booking_confirmed_notification,
+    send_booking_rescheduled_notification,
+    send_booking_rejected_notification,
+    send_booking_cancelled_notification,
+)
 from .scanner import RepositoryScanner, download_github_repo_files
 from .oauth_providers import (
     ProviderHTTPError,
@@ -68,7 +79,23 @@ from .oauth_providers import (
 )
 
 EMAIL_REGEX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-ALLOWED_STATUSES = {"Pending", "Confirmed", "Rescheduled", "Cancelled", "Completed"}
+ALLOWED_STATUSES = {
+    "pending",
+    "confirmed",
+    "rescheduled",
+    "cancelled",
+    "rejected",
+    "completed",
+}
+
+VALID_STATUS_TRANSITIONS = {
+    "pending": {"confirmed", "rescheduled", "cancelled", "rejected"},
+    "rescheduled": {"confirmed", "cancelled", "rejected", "rescheduled"},
+    "confirmed": {"completed", "rescheduled", "cancelled"},
+    "completed": set(),
+    "rejected": set(),
+    "cancelled": set(),
+}
 REPO_PROVIDERS = {"github", "gitlab", "bitbucket"}
 
 
@@ -170,6 +197,48 @@ class AdminBookingUpdatePayload(BaseModel):
     status: str
     admin_notes: Optional[str] = None
     confirmed_datetime: Optional[str] = None
+    meeting_url: Optional[str] = None
+    proposed_date: Optional[str] = None
+    proposed_time: Optional[str] = None
+    reschedule_reason: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    cancellation_reason: Optional[str] = None
+
+
+class AdminConfirmBookingPayload(BaseModel):
+    confirmed_datetime: Optional[str] = None
+    meeting_url: Optional[str] = None
+    admin_notes: Optional[str] = None
+
+
+class AdminRescheduleBookingPayload(BaseModel):
+    proposed_date: str
+    proposed_time: str
+    reschedule_reason: Optional[str] = None
+    admin_notes: Optional[str] = None
+    meeting_url: Optional[str] = None
+
+
+class AdminRejectBookingPayload(BaseModel):
+    rejection_reason: str
+    admin_notes: Optional[str] = None
+
+
+class AdminCancelBookingPayload(BaseModel):
+    cancellation_reason: str
+    admin_notes: Optional[str] = None
+
+
+class AdminCompleteBookingPayload(BaseModel):
+    admin_notes: Optional[str] = None
+
+
+class UserCancelBookingPayload(BaseModel):
+    cancellation_reason: Optional[str] = None
+
+
+class UserDeclineReschedulePayload(BaseModel):
+    reason: Optional[str] = None
 
 
 # ============================================================================
@@ -263,9 +332,22 @@ def _serialize_provider_connection(provider: str, row: Optional[Any]) -> dict[st
         else False
     )
 
+    status = row["status"]
+    last_error = row["last_error"]
+    # If previously marked authorization_failed due to missing env vars, but now configured, clear the error
+    if (
+        status == "authorization_failed"
+        and cfg["configured"]
+        and last_error
+        and "OAuth" in last_error
+        and "not configured" in last_error
+    ):
+        status = "not_connected"
+        last_error = None
+
     return {
         "provider": provider,
-        "status": row["status"],
+        "status": status,
         "oauth_configured": cfg["configured"],
         "required_env": cfg["required_env"],
         "redirect_uri": cfg["redirect_uri"],
@@ -274,7 +356,7 @@ def _serialize_provider_connection(provider: str, row: Optional[Any]) -> dict[st
         "provider_username": row["provider_username"],
         "provider_email": row["provider_email"],
         "scopes": row["scopes"],
-        "accessible_repos_count": row["accessible_repos_count"] if row["status"] == "connected" else 0,
+        "accessible_repos_count": row["accessible_repos_count"] if status == "connected" else 0,
         "repositories": repos,
         "selected_repo_full_name": selected_repo,
         "selected_branch": selected_branch,
@@ -282,7 +364,7 @@ def _serialize_provider_connection(provider: str, row: Optional[Any]) -> dict[st
         "selected_repo_default_branch": selected_repo_default_branch,
         "selected_repo_language": selected_repo_language,
         "selected_repo_private": selected_repo_private,
-        "last_error": row["last_error"],
+        "last_error": last_error,
         "last_verified_at": row["last_verified_at"],
         "updated_at": row["updated_at"],
     }
@@ -443,10 +525,32 @@ def _ensure_strict_relative_redirect(raw_path: Optional[str], default: str = "/w
     return validate_relative_redirect(cleaned, default=default)
 
 
+def _validate_status_transition(current_status: str, new_status: str) -> str:
+    cur = (current_status or "pending").strip().lower()
+    nxt = (new_status or "").strip().lower()
+
+    if nxt not in ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{new_status}'. Allowed statuses: {', '.join(sorted(ALLOWED_STATUSES))}",
+        )
+
+    if cur == nxt:
+        return nxt
+
+    valid_targets = VALID_STATUS_TRANSITIONS.get(cur, set())
+    if nxt not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot transition booking status from '{cur}' to '{nxt}'. Allowed transitions from '{cur}': {', '.join(sorted(valid_targets)) if valid_targets else 'None (terminal state)'}.",
+        )
+    return nxt
+
+
 def _serialize_booking(conn, row) -> dict:
     history_rows = conn.execute(
         """
-        SELECT id, booking_id, previous_status, new_status, changed_by_email, notes, changed_at
+        SELECT id, booking_id, previous_status, new_status, changed_by_user_id, changed_by_email, notes, changed_at
         FROM booking_status_history
         WHERE booking_id = ?
         ORDER BY changed_at DESC
@@ -454,24 +558,49 @@ def _serialize_booking(conn, row) -> dict:
         (row["id"],),
     ).fetchall()
 
+    status_history = []
+    for h in history_rows:
+        hd = dict(h)
+        # Ensure audit trail date bug and field aliases are cleanly resolved:
+        hd["created_at"] = hd.get("changed_at")
+        hd["note"] = hd.get("notes")
+        if hd.get("previous_status"):
+            hd["previous_status"] = str(hd["previous_status"]).lower()
+        if hd.get("new_status"):
+            hd["new_status"] = str(hd["new_status"]).lower()
+        status_history.append(hd)
+
+    row_dict = dict(row)
     return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "full_name": row["full_name"],
-        "work_email": row["work_email"],
-        "company": row["company"],
-        "team_size": row["team_size"],
-        "preferred_date": row["preferred_date"],
-        "preferred_time": row["preferred_time"],
-        "timezone": row["timezone"],
-        "message": row["message"],
-        "status": row["status"],
-        "admin_notes": row["admin_notes"],
-        "confirmed_datetime": row["confirmed_datetime"],
-        "email_notification_status": row["email_notification_status"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "status_history": [dict(h) for h in history_rows],
+        "id": row_dict.get("id"),
+        "user_id": row_dict.get("user_id"),
+        "full_name": row_dict.get("full_name"),
+        "work_email": row_dict.get("work_email"),
+        "company": row_dict.get("company"),
+        "team_size": row_dict.get("team_size"),
+        "preferred_date": row_dict.get("preferred_date"),
+        "preferred_time": row_dict.get("preferred_time"),
+        "timezone": row_dict.get("timezone"),
+        "message": row_dict.get("message"),
+        "status": (row_dict.get("status") or "pending").lower(),
+        "admin_notes": row_dict.get("admin_notes"),
+        "confirmed_datetime": row_dict.get("confirmed_datetime"),
+        "meeting_url": row_dict.get("meeting_url"),
+        "confirmed_by_admin_id": row_dict.get("confirmed_by_admin_id"),
+        "confirmed_at": row_dict.get("confirmed_at"),
+        "proposed_date": row_dict.get("proposed_date"),
+        "proposed_time": row_dict.get("proposed_time"),
+        "reschedule_reason": row_dict.get("reschedule_reason"),
+        "reschedule_status": row_dict.get("reschedule_status"),
+        "rejection_reason": row_dict.get("rejection_reason"),
+        "cancellation_reason": row_dict.get("cancellation_reason"),
+        "cancelled_by": row_dict.get("cancelled_by"),
+        "cancelled_at": row_dict.get("cancelled_at"),
+        "completed_at": row_dict.get("completed_at"),
+        "email_notification_status": row_dict.get("email_notification_status") or "not_configured",
+        "created_at": row_dict.get("created_at"),
+        "updated_at": row_dict.get("updated_at"),
+        "status_history": status_history,
     }
 
 
@@ -982,6 +1111,27 @@ def list_user_integrations(current_user: dict = Depends(get_current_user)):
         "status": "success",
         "user_id": current_user["id"],
         "integrations": integrations,
+    }
+
+
+@app.get("/api/integrations/{provider}/status")
+def repository_provider_oauth_status(provider: str):
+    """
+    Diagnostic status endpoint reporting OAuth readiness for GitHub/GitLab/Bitbucket.
+    Never returns secrets or tokens.
+    """
+    prov = _validate_repo_provider(provider)
+    cfg = get_provider_oauth_config(prov)
+    missing_vars = [k for k in cfg["required_env"][:2] if not os.environ.get(k)]
+    return {
+        "status": "success",
+        "provider": prov,
+        "configured": cfg["configured"],
+        "client_id_configured": bool(cfg.get("client_id")),
+        "client_secret_configured": bool(cfg.get("client_secret")),
+        "redirect_uri": cfg["redirect_uri"],
+        "required_env": cfg["required_env"],
+        "missing_env": missing_vars,
     }
 
 
@@ -2572,7 +2722,7 @@ def create_demo_request(
             WHERE lower(work_email) = ?
               AND preferred_date = ?
               AND preferred_time = ?
-              AND status = 'Pending'
+              AND lower(status) = 'pending'
               AND created_at >= ?
             """,
             (work_email, preferred_date, preferred_time, five_mins_ago_iso),
@@ -2600,7 +2750,7 @@ def create_demo_request(
                 status, admin_notes, confirmed_datetime, email_notification_status,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', NULL, NULL, 'not_configured', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'not_configured', ?, ?)
             """,
             (
                 booking_id,
@@ -2624,7 +2774,7 @@ def create_demo_request(
                 id, booking_id, previous_status, new_status,
                 changed_by_user_id, changed_by_email, notes, changed_at
             )
-            VALUES (?, ?, NULL, 'Pending', ?, ?, 'Initial demo request submitted.', ?)
+            VALUES (?, ?, NULL, 'pending', ?, ?, 'Initial demo request submitted.', ?)
             """,
             (
                 f"hist_{uuid.uuid4().hex[:12]}",
@@ -2640,7 +2790,7 @@ def create_demo_request(
         ).fetchone()
         booking_dict = _serialize_booking(conn, booking_row)
 
-        notif_status, notif_msg = send_admin_booking_notification(booking_dict)
+        notif_status, notif_msg = send_booking_received_notification(booking_dict)
         conn.execute(
             "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
             (notif_status, booking_id),
@@ -2654,9 +2804,9 @@ def create_demo_request(
         "email_notification_status": notif_status,
         "email_notification_note": notif_msg,
         "message": (
-            "Demo request received and saved with status 'Pending'. "
+            "Demo request received and saved with status 'pending'. "
             "Please note: this is a received request, not yet a confirmed appointment. "
-            "An administrator will confirm or reschedule your slot."
+            "An administrator will review and confirm or reschedule your slot."
         ),
     }
 
@@ -2700,38 +2850,341 @@ def get_my_booking_detail(
     return {"status": "success", "booking": booking}
 
 
+@app.post("/api/my/bookings/{booking_id}/cancel")
+def user_cancel_booking(
+    booking_id: str,
+    payload: Optional[UserCancelBookingPayload] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    if payload is None:
+        payload = UserCancelBookingPayload()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cancellation_reason = (
+        payload.cancellation_reason.strip()
+        if payload.cancellation_reason and payload.cancellation_reason.strip()
+        else "Cancelled by user via portal."
+    )
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row or row["user_id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You do not have permission to modify this booking.",
+            )
+
+        cur_status = (row["status"] or "pending").lower()
+        if cur_status in {"cancelled", "rejected", "completed"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Booking policy forbids cancellation: this booking is already '{cur_status}'.",
+            )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'cancelled',
+                cancelled_by = 'user',
+                cancellation_reason = ?,
+                cancelled_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (cancellation_reason, now_iso, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'cancelled', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                current_user["id"],
+                current_user["email"],
+                f"Cancelled by user: {cancellation_reason}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_cancelled_notification(
+            booking_dict, cancellation_reason, cancelled_by="Requester (User)"
+        )
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": "Demo booking has been cancelled.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/my/bookings/{booking_id}/accept-reschedule")
+def user_accept_reschedule(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row or row["user_id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You do not have permission to modify this booking.",
+            )
+
+        cur_status = (row["status"] or "pending").lower()
+        if cur_status != "rescheduled":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot accept reschedule: booking is currently in status '{cur_status}'.",
+            )
+
+        prop_date = row["proposed_date"] or row["preferred_date"]
+        prop_time = row["proposed_time"] or row["preferred_time"]
+        tz = row["timezone"]
+        confirmed_slot = f"{prop_date} at {prop_time} ({tz})"
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'confirmed',
+                reschedule_status = 'accepted',
+                preferred_date = ?,
+                preferred_time = ?,
+                confirmed_datetime = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (prop_date, prop_time, confirmed_slot, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, 'rescheduled', 'confirmed', ?, ?, 'User accepted proposed reschedule time. Demo booking confirmed.', ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                current_user["id"],
+                current_user["email"],
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_confirmed_notification(booking_dict)
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": "Proposed reschedule time accepted. Demo walkthrough confirmed.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/my/bookings/{booking_id}/decline-reschedule")
+def user_decline_reschedule(
+    booking_id: str,
+    payload: UserDeclineReschedulePayload,
+    current_user: dict = Depends(get_current_user),
+):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    reason = (
+        payload.reason.strip()
+        if payload.reason and payload.reason.strip()
+        else "User declined proposed reschedule appointment."
+    )
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row or row["user_id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You do not have permission to modify this booking.",
+            )
+
+        cur_status = (row["status"] or "pending").lower()
+        if cur_status != "rescheduled":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot decline reschedule: booking is currently in status '{cur_status}'.",
+            )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'cancelled',
+                reschedule_status = 'declined',
+                cancelled_by = 'user',
+                cancellation_reason = ?,
+                cancelled_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (reason, now_iso, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, 'rescheduled', 'cancelled', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                current_user["id"],
+                current_user["email"],
+                f"User declined reschedule: {reason}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_cancelled_notification(
+            booking_dict, reason, cancelled_by="Requester (User)"
+        )
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": "Proposed reschedule time declined. Demo booking cancelled.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Admin Demo Requests Endpoints
+# ----------------------------------------------------------------------------
+
+
 @app.get("/api/admin/bookings")
+@app.get("/api/admin/demo-requests")
 def admin_list_bookings(
     status: Optional[str] = Query(default=None),
+    organization: Optional[str] = Query(default=None),
+    email: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     _admin: dict = Depends(require_admin),
 ):
-    query = "SELECT * FROM demo_bookings WHERE 1=1"
-    params: list = []
-
-    if status and status != "All":
-        query += " AND status = ?"
-        params.append(status)
-
-    if search and search.strip():
-        q = f"%{search.strip().lower()}%"
-        query += """ AND (
-            lower(full_name) LIKE ? OR
-            lower(work_email) LIKE ? OR
-            lower(coalesce(company, '')) LIKE ? OR
-            lower(id) LIKE ?
-        )"""
-        params.extend([q, q, q, q])
-
-    query += " ORDER BY created_at DESC"
-
     with get_db_connection() as conn:
+        # 1. Calculate overall summary counts across all requests
+        all_counts_rows = conn.execute(
+            "SELECT lower(status) as st, COUNT(*) as cnt FROM demo_bookings GROUP BY lower(status)"
+        ).fetchall()
+        st_map = {row["st"]: row["cnt"] for row in all_counts_rows}
+        pending_cnt = st_map.get("pending", 0)
+        confirmed_cnt = st_map.get("confirmed", 0)
+        rescheduled_cnt = st_map.get("rescheduled", 0)
+        completed_cnt = st_map.get("completed", 0)
+        cancelled_cnt = st_map.get("cancelled", 0)
+        rejected_cnt = st_map.get("rejected", 0)
+        total_cnt = sum(st_map.values())
+
+        # 2. Build filtered query
+        query = "SELECT * FROM demo_bookings WHERE 1=1"
+        params: list = []
+
+        if status and status.strip() and status.strip().lower() != "all":
+            norm_status = status.strip().lower()
+            if norm_status == "cancelled_or_rejected":
+                query += " AND lower(status) IN ('cancelled', 'rejected')"
+            else:
+                query += " AND lower(status) = ?"
+                params.append(norm_status)
+
+        if organization and organization.strip():
+            query += " AND lower(coalesce(company, '')) LIKE ?"
+            params.append(f"%{organization.strip().lower()}%")
+
+        if email and email.strip():
+            query += " AND lower(work_email) LIKE ?"
+            params.append(f"%{email.strip().lower()}%")
+
+        if date and date.strip():
+            query += " AND preferred_date = ?"
+            params.append(date.strip())
+
+        if search and search.strip():
+            q = f"%{search.strip().lower()}%"
+            query += """ AND (
+                lower(full_name) LIKE ? OR
+                lower(work_email) LIKE ? OR
+                lower(coalesce(company, '')) LIKE ? OR
+                lower(id) LIKE ? OR
+                lower(coalesce(message, '')) LIKE ?
+            )"""
+            params.extend([q, q, q, q, q])
+
+        query += " ORDER BY created_at DESC"
+
         rows = conn.execute(query, params).fetchall()
         bookings = [_serialize_booking(conn, r) for r in rows]
 
     return {
         "status": "success",
         "count": len(bookings),
+        "counts": {
+            "total": total_cnt,
+            "pending": pending_cnt,
+            "confirmed": confirmed_cnt,
+            "rescheduled": rescheduled_cnt,
+            "completed": completed_cnt,
+            "cancelled": cancelled_cnt,
+            "rejected": rejected_cnt,
+            "cancelled_or_rejected": cancelled_cnt + rejected_cnt,
+        },
         "bookings": bookings,
     }
 
@@ -2752,19 +3205,459 @@ def admin_get_booking(
     return {"status": "success", "booking": booking}
 
 
+@app.post("/api/admin/bookings/{booking_id}/confirm")
+def admin_confirm_booking(
+    booking_id: str,
+    payload: Optional[AdminConfirmBookingPayload] = None,
+    admin_user: dict = Depends(require_admin),
+):
+    if payload is None:
+        payload = AdminConfirmBookingPayload()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        cur_status = (row["status"] or "pending").lower()
+        _validate_status_transition(cur_status, "confirmed")
+
+        confirmed_slot = (
+            payload.confirmed_datetime.strip()
+            if payload.confirmed_datetime and payload.confirmed_datetime.strip()
+            else f"{row['preferred_date']} at {row['preferred_time']} ({row['timezone']})"
+        )
+        meeting_url = (
+            payload.meeting_url.strip()
+            if payload.meeting_url and payload.meeting_url.strip()
+            else row["meeting_url"]
+        )
+        notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes and payload.admin_notes.strip()
+            else row["admin_notes"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'confirmed',
+                confirmed_datetime = ?,
+                meeting_url = ?,
+                admin_notes = ?,
+                confirmed_by_admin_id = ?,
+                confirmed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                confirmed_slot,
+                meeting_url,
+                notes,
+                admin_user["id"],
+                now_iso,
+                now_iso,
+                booking_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                admin_user["id"],
+                admin_user["email"],
+                notes or f"Demo slot confirmed for {confirmed_slot}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_confirmed_notification(booking_dict)
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": f"Demo booking {booking_id} confirmed.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/admin/bookings/{booking_id}/reschedule")
+def admin_reschedule_booking(
+    booking_id: str,
+    payload: AdminRescheduleBookingPayload,
+    admin_user: dict = Depends(require_admin),
+):
+    proposed_date = payload.proposed_date.strip()
+    proposed_time = payload.proposed_time.strip()
+    if not proposed_date or not proposed_time:
+        raise HTTPException(
+            status_code=400,
+            detail="Both proposed date (YYYY-MM-DD) and time (HH:MM) are required for rescheduling.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        cur_status = (row["status"] or "pending").lower()
+        _validate_status_transition(cur_status, "rescheduled")
+
+        reschedule_reason = (
+            payload.reschedule_reason.strip()
+            if payload.reschedule_reason and payload.reschedule_reason.strip()
+            else "Proposed schedule adjustment by coordinator."
+        )
+        admin_notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes and payload.admin_notes.strip()
+            else row["admin_notes"]
+        )
+        meeting_url = (
+            payload.meeting_url.strip()
+            if payload.meeting_url and payload.meeting_url.strip()
+            else row["meeting_url"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'rescheduled',
+                proposed_date = ?,
+                proposed_time = ?,
+                reschedule_reason = ?,
+                reschedule_status = 'pending_user_acceptance',
+                admin_notes = ?,
+                meeting_url = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                proposed_date,
+                proposed_time,
+                reschedule_reason,
+                admin_notes,
+                meeting_url,
+                now_iso,
+                booking_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'rescheduled', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                admin_user["id"],
+                admin_user["email"],
+                f"Proposed reschedule to {proposed_date} at {proposed_time} ({row['timezone']}). Reason: {reschedule_reason}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_rescheduled_notification(booking_dict)
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": f"Demo booking {booking_id} rescheduled. Proposed slot sent to user for acceptance.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/admin/bookings/{booking_id}/reject")
+def admin_reject_booking(
+    booking_id: str,
+    payload: AdminRejectBookingPayload,
+    admin_user: dict = Depends(require_admin),
+):
+    rejection_reason = payload.rejection_reason.strip()
+    if not rejection_reason or len(rejection_reason) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="A substantive rejection reason is required (at least 3 characters).",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        cur_status = (row["status"] or "pending").lower()
+        _validate_status_transition(cur_status, "rejected")
+
+        admin_notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes and payload.admin_notes.strip()
+            else row["admin_notes"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'rejected',
+                rejection_reason = ?,
+                admin_notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (rejection_reason, admin_notes, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'rejected', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                admin_user["id"],
+                admin_user["email"],
+                f"Rejected: {rejection_reason}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_rejected_notification(
+            booking_dict, rejection_reason
+        )
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": f"Demo booking {booking_id} rejected.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/admin/bookings/{booking_id}/cancel")
+def admin_cancel_booking(
+    booking_id: str,
+    payload: AdminCancelBookingPayload,
+    admin_user: dict = Depends(require_admin),
+):
+    cancellation_reason = payload.cancellation_reason.strip()
+    if not cancellation_reason:
+        raise HTTPException(
+            status_code=400,
+            detail="A cancellation reason is required.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        cur_status = (row["status"] or "pending").lower()
+        _validate_status_transition(cur_status, "cancelled")
+
+        admin_notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes and payload.admin_notes.strip()
+            else row["admin_notes"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'cancelled',
+                cancelled_by = 'admin',
+                cancellation_reason = ?,
+                cancelled_at = ?,
+                admin_notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (cancellation_reason, now_iso, admin_notes, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'cancelled', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                admin_user["id"],
+                admin_user["email"],
+                f"Cancelled by administrator: {cancellation_reason}",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+        notif_status, notif_msg = send_booking_cancelled_notification(
+            booking_dict, cancellation_reason, cancelled_by="Administrator"
+        )
+        conn.execute(
+            "UPDATE demo_bookings SET email_notification_status = ? WHERE id = ?",
+            (notif_status, booking_id),
+        )
+        booking_dict["email_notification_status"] = notif_status
+
+    return {
+        "status": "success",
+        "message": f"Demo booking {booking_id} cancelled by administrator.",
+        "booking": booking_dict,
+        "email_notification_status": notif_status,
+        "email_notification_note": notif_msg,
+    }
+
+
+@app.post("/api/admin/bookings/{booking_id}/complete")
+def admin_complete_booking(
+    booking_id: str,
+    payload: Optional[AdminCompleteBookingPayload] = None,
+    admin_user: dict = Depends(require_admin),
+):
+    if payload is None:
+        payload = AdminCompleteBookingPayload()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        cur_status = (row["status"] or "pending").lower()
+        _validate_status_transition(cur_status, "completed")
+
+        admin_notes = (
+            payload.admin_notes.strip()
+            if payload.admin_notes and payload.admin_notes.strip()
+            else row["admin_notes"]
+        )
+
+        conn.execute(
+            """
+            UPDATE demo_bookings
+            SET status = 'completed',
+                completed_at = ?,
+                admin_notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now_iso, admin_notes, now_iso, booking_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO booking_status_history (
+                id, booking_id, previous_status, new_status,
+                changed_by_user_id, changed_by_email, notes, changed_at
+            )
+            VALUES (?, ?, ?, 'completed', ?, ?, ?, ?)
+            """,
+            (
+                f"hist_{uuid.uuid4().hex[:12]}",
+                booking_id,
+                cur_status,
+                admin_user["id"],
+                admin_user["email"],
+                admin_notes or "Demo walkthrough marked as completed.",
+                now_iso,
+            ),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM demo_bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        booking_dict = _serialize_booking(conn, updated_row)
+
+    return {
+        "status": "success",
+        "message": f"Demo booking {booking_id} marked as completed.",
+        "booking": booking_dict,
+    }
+
+
 @app.patch("/api/admin/bookings/{booking_id}")
 def admin_update_booking(
     booking_id: str,
     payload: AdminBookingUpdatePayload,
     admin_user: dict = Depends(require_admin),
 ):
-    new_status = payload.status.strip()
-    if new_status not in ALLOWED_STATUSES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status '{new_status}'. Allowed: {', '.join(sorted(ALLOWED_STATUSES))}",
-        )
-
+    target_status = payload.status.strip().lower()
     now_iso = datetime.now(timezone.utc).isoformat()
 
     with get_db_connection() as conn:
@@ -2774,7 +3667,9 @@ def admin_update_booking(
         if not existing:
             raise HTTPException(status_code=404, detail="Booking not found")
 
-        prev_status = existing["status"]
+        prev_status = (existing["status"] or "pending").lower()
+        validated_status = _validate_status_transition(prev_status, target_status)
+
         admin_notes = (
             payload.admin_notes.strip()
             if payload.admin_notes is not None
@@ -2785,16 +3680,68 @@ def admin_update_booking(
             if payload.confirmed_datetime is not None
             else existing["confirmed_datetime"]
         )
+        meeting_url = (
+            payload.meeting_url.strip()
+            if payload.meeting_url is not None
+            else existing["meeting_url"]
+        )
+        proposed_date = (
+            payload.proposed_date.strip()
+            if payload.proposed_date is not None
+            else existing["proposed_date"]
+        )
+        proposed_time = (
+            payload.proposed_time.strip()
+            if payload.proposed_time is not None
+            else existing["proposed_time"]
+        )
+        reschedule_reason = (
+            payload.reschedule_reason.strip()
+            if payload.reschedule_reason is not None
+            else existing["reschedule_reason"]
+        )
+        rejection_reason = (
+            payload.rejection_reason.strip()
+            if payload.rejection_reason is not None
+            else existing["rejection_reason"]
+        )
+        cancellation_reason = (
+            payload.cancellation_reason.strip()
+            if payload.cancellation_reason is not None
+            else existing["cancellation_reason"]
+        )
 
         conn.execute(
             """
             UPDATE demo_bookings
-            SET status = ?, admin_notes = ?, confirmed_datetime = ?, updated_at = ?
+            SET status = ?,
+                admin_notes = ?,
+                confirmed_datetime = ?,
+                meeting_url = ?,
+                proposed_date = ?,
+                proposed_time = ?,
+                reschedule_reason = ?,
+                rejection_reason = ?,
+                cancellation_reason = ?,
+                updated_at = ?
             WHERE id = ?
             """,
-            (new_status, admin_notes, confirmed_dt, now_iso, booking_id),
+            (
+                validated_status,
+                admin_notes,
+                confirmed_dt,
+                meeting_url,
+                proposed_date,
+                proposed_time,
+                reschedule_reason,
+                rejection_reason,
+                cancellation_reason,
+                now_iso,
+                booking_id,
+            ),
         )
 
+        note_text = admin_notes or f"Status updated from {prev_status} to {validated_status}"
         conn.execute(
             """
             INSERT INTO booking_status_history (
@@ -2807,10 +3754,10 @@ def admin_update_booking(
                 f"hist_{uuid.uuid4().hex[:12]}",
                 booking_id,
                 prev_status,
-                new_status,
+                validated_status,
                 admin_user["id"],
                 admin_user["email"],
-                admin_notes or f"Status updated from {prev_status} to {new_status}",
+                note_text,
                 now_iso,
             ),
         )

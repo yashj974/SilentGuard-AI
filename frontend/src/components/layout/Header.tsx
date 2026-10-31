@@ -415,13 +415,13 @@ export const Header: React.FC = () => {
 
                   {user.role === 'admin' && (
                     <Link
-                      to="/admin/bookings"
+                      to="/admin/demo-requests"
                       onClick={() => setUserDropdownOpen(false)}
                       className="flex items-center justify-between rounded-xl px-3.5 py-2 text-xs font-medium text-[#FF5722] hover:bg-[#FF5722]/10 transition-colors"
                     >
                       <span className="flex items-center gap-2.5">
                         <ShieldCheck className="h-3.5 w-3.5" />
-                        <span>Admin Demo Requests</span>
+                        <span>Demo Requests</span>
                       </span>
                       <span className="rounded bg-[#FF5722]/20 px-1.5 py-0.5 font-mono text-[9px] uppercase">
                         Admin

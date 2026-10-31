@@ -1,12 +1,15 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger("silentguard.oauth")
 
 
 # ============================================================================
@@ -59,7 +62,7 @@ def validate_gitlab_instance_url(raw_url: Optional[str] = None) -> str:
 
 def get_backend_base_url() -> str:
     _load_backend_dotenv()
-    return os.environ.get("SILENTGUARD_BACKEND_URL", "http://localhost:8001").strip().rstrip("/")
+    return os.environ.get("SILENTGUARD_BACKEND_URL", "http://localhost:8000").strip().rstrip("/")
 
 
 def get_frontend_base_url() -> str:
@@ -153,38 +156,41 @@ def http_request(
 # Provider Configuration Inspection & Secure .env Loading
 # ============================================================================
 
-_ENV_FILE_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", ".env")
-)
+_BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_ROOT_DIR = os.path.abspath(os.path.join(_BACKEND_DIR, ".."))
+_ENV_FILE_PATH = os.path.join(_BACKEND_DIR, ".env")
+_ROOT_ENV_FILE_PATH = os.path.join(_ROOT_DIR, ".env")
 
 
 def _load_backend_dotenv() -> None:
     """
-    Load key=value pairs from backend/.env using UTF-8-SIG (BOM-safe) without
-    overwriting existing non-empty environment variables or exposing secrets.
+    Load key=value pairs from backend/.env (or workspace .env fallback) using UTF-8-SIG (BOM-safe).
     """
-    if not os.path.exists(_ENV_FILE_PATH):
+    target_files = [p for p in (_ENV_FILE_PATH, _ROOT_ENV_FILE_PATH) if os.path.exists(p)]
+    if not target_files:
         return
-    try:
-        from dotenv import load_dotenv  # type: ignore[import-not-found]
 
-        load_dotenv(dotenv_path=_ENV_FILE_PATH, encoding="utf-8-sig", override=False)
-    except Exception:
-        pass
+    for env_path in target_files:
+        try:
+            from dotenv import load_dotenv  # type: ignore[import-not-found]
 
-    try:
-        with open(_ENV_FILE_PATH, "r", encoding="utf-8-sig") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                key = k.lstrip("\ufeff").strip()
-                val = v.strip().strip('"').strip("'")
-                if key and val and not os.environ.get(key):
-                    os.environ[key] = val
-    except OSError:
-        pass
+            load_dotenv(dotenv_path=env_path, encoding="utf-8-sig", override=True)
+        except Exception:
+            pass
+
+        try:
+            with open(env_path, "r", encoding="utf-8-sig") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    key = k.lstrip("\ufeff").strip()
+                    val = v.strip().strip('"').strip("'")
+                    if key and val:
+                        os.environ[key] = val
+        except OSError:
+            pass
 
 
 _load_backend_dotenv()
@@ -195,13 +201,14 @@ def get_provider_oauth_config(provider: str) -> dict[str, Any]:
     p = provider.strip().lower()
     backend_base = get_backend_base_url()
 
+    cfg: dict[str, Any]
     if p == "google":
         client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
         client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
         redirect_uri = os.environ.get(
             "GOOGLE_REDIRECT_URI", f"{backend_base}/api/auth/google/callback"
         ).strip()
-        return {
+        cfg = {
             "provider": "google",
             "configured": bool(client_id and client_secret),
             "client_id": client_id,
@@ -212,14 +219,13 @@ def get_provider_oauth_config(provider: str) -> dict[str, Any]:
             "scopes": "openid email profile",
             "required_env": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"],
         }
-
-    if p == "github":
+    elif p == "github":
         client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
         client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "").strip()
         redirect_uri = os.environ.get(
             "GITHUB_REDIRECT_URI", f"{backend_base}/api/integrations/github/callback"
         ).strip()
-        return {
+        cfg = {
             "provider": "github",
             "configured": bool(client_id and client_secret),
             "client_id": client_id,
@@ -230,15 +236,14 @@ def get_provider_oauth_config(provider: str) -> dict[str, Any]:
             "scopes": "read:user user:email repo",
             "required_env": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI"],
         }
-
-    if p == "gitlab":
+    elif p == "gitlab":
         client_id = os.environ.get("GITLAB_CLIENT_ID", "").strip()
         client_secret = os.environ.get("GITLAB_CLIENT_SECRET", "").strip()
         instance_url = validate_gitlab_instance_url()
         redirect_uri = os.environ.get(
             "GITLAB_REDIRECT_URI", f"{backend_base}/api/integrations/gitlab/callback"
         ).strip()
-        return {
+        cfg = {
             "provider": "gitlab",
             "configured": bool(client_id and client_secret),
             "client_id": client_id,
@@ -255,14 +260,13 @@ def get_provider_oauth_config(provider: str) -> dict[str, Any]:
                 "GITLAB_INSTANCE_URL",
             ],
         }
-
-    if p == "bitbucket":
+    elif p == "bitbucket":
         client_id = os.environ.get("BITBUCKET_CLIENT_ID", "").strip()
         client_secret = os.environ.get("BITBUCKET_CLIENT_SECRET", "").strip()
         redirect_uri = os.environ.get(
             "BITBUCKET_REDIRECT_URI", f"{backend_base}/api/integrations/bitbucket/callback"
         ).strip()
-        return {
+        cfg = {
             "provider": "bitbucket",
             "configured": bool(client_id and client_secret),
             "client_id": client_id,
@@ -277,8 +281,17 @@ def get_provider_oauth_config(provider: str) -> dict[str, Any]:
                 "BITBUCKET_REDIRECT_URI",
             ],
         }
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
 
-    raise ValueError(f"Unsupported provider: {provider}")
+    logger.info(
+        "Safe OAuth diagnostic check: provider=%s, client_id_configured=%s, client_secret_configured=%s, redirect_uri=%s",
+        p,
+        bool(cfg.get("client_id")),
+        bool(cfg.get("client_secret")),
+        cfg.get("redirect_uri"),
+    )
+    return cfg
 
 
 # ============================================================================

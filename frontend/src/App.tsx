@@ -66,6 +66,14 @@ export function App() {
               <Route path="/profile" element={<ProfilePage />} />
               <Route path="/my-bookings" element={<MyBookingsPage />} />
               <Route
+                path="/admin/demo-requests"
+                element={
+                  <AdminRoute>
+                    <AdminBookingsPage />
+                  </AdminRoute>
+                }
+              />
+              <Route
                 path="/admin/bookings"
                 element={
                   <AdminRoute>
